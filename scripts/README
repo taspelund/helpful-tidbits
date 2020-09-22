@@ -1,0 +1,34 @@
+evpn_mac_consistency_check.py
+-----------------------------
+Descriptions:
+  - This script will search multiple cl-support files for inconsistencies
+    regarding location (vtep address) of kernel/zebra macs. Optionally run with
+    -m/-v to filter for a specific mac/vni. Parses/compares all macs by default.
+
+usage: evpn_mac_consistency_check.py [-h] [-m MAC] [-v VNI] ...
+
+positional arguments:
+  bundles
+
+optional arguments:
+  -h, --help         show this help message and exit
+  -m MAC, --mac MAC  search for specific mac. format must match output of
+                     'bridge fdb show'. must be used with -v/--vni
+  -v VNI, --vni VNI  search for mac within this vni. supply vni in numeric
+                     format. must be used with -m/--mac
+
+mac.sh
+------
+Descriptions:
+  - This script will run iproute2's `bridge fdb [add|del|replace]` against a list of mac addresses defined in an external file.
+  - Useful for simulating mac moves without a packet generator.
+
+usage: mac.sh { add | del | replace } { bridge-port } { vlan-id } { static | dynamic } { /path/to/mac/file }
+
+
+compare-macs.py
+---------------
+Descriptions:
+  - This script collects remote fdb entries from the Linux kernel (sw) and Mellanox sdk (hw) and compares the VTEP IP associated with them.
+
+usage: compare-macs.py
