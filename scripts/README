@@ -1,9 +1,47 @@
+cl-host-checker.py
+------------------
+Descriptions:
+  - Launches a lookup of an individual ARP/NDP entry and returns a summary of
+    its attributes. This can be run live or against a cl-support bundle, and
+    can check both software and hardware (bcm + mlx) neigh tables.
+
+usage: cl-host-checker [-h] [-a {bcm,mlx}] [-d DIRECTORY] [-l]
+                       [-t {4,6,iface,mac}]
+                       match
+
+positional arguments:
+  match                 specify search string
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -a {bcm,mlx}, --asic {bcm,mlx}
+                        specify ASIC manufacturer. supported inputs:
+                        ['bcm'|'mlx']
+  -d DIRECTORY, --directory DIRECTORY
+                        base directory is searched for input files, e.g.
+                        'base_dir/Support' or 'base_dir/support'
+  -l, --live            capture output from shell commands instead of cl-
+                        support
+  -t {4,6,iface,mac}, --search_type {4,6,iface,mac}
+                        override detection of search type. supported types:
+                        ['4'|'6'|'iface'|'mac']
+
+
+compare-macs.py
+---------------
+Descriptions:
+  - Collects remote fdb entries from the Linux kernel (sw) and Mellanox sdk (hw)
+    and compares the VTEP IP associated with them.
+
+usage: compare-macs.py
+
+
 evpn_mac_consistency_check.py
 -----------------------------
 Descriptions:
-  - This script will search multiple cl-support files for inconsistencies
-    regarding location (vtep address) of kernel/zebra macs. Optionally run with
-    -m/-v to filter for a specific mac/vni. Parses/compares all macs by default.
+  - Searches multiple cl-support files for inconsistencies regarding location
+    (vtep address) of kernel/zebra macs. Optionally run with -m/-v to filter
+    for a specific mac/vni. Parses/compares all macs by default.
 
 usage: evpn_mac_consistency_check.py [-h] [-m MAC] [-v VNI] ...
 
@@ -20,15 +58,8 @@ optional arguments:
 mac.sh
 ------
 Descriptions:
-  - This script will run iproute2's `bridge fdb [add|del|replace]` against a list of mac addresses defined in an external file.
+  - Runs iproute2's `bridge fdb [add|del|replace]` against a list of mac
+    addresses defined in an external file.
   - Useful for simulating mac moves without a packet generator.
 
 usage: mac.sh { add | del | replace } { bridge-port } { vlan-id } { static | dynamic } { /path/to/mac/file }
-
-
-compare-macs.py
----------------
-Descriptions:
-  - This script collects remote fdb entries from the Linux kernel (sw) and Mellanox sdk (hw) and compares the VTEP IP associated with them.
-
-usage: compare-macs.py
