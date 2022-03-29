@@ -63,3 +63,24 @@ Descriptions:
   - Useful for simulating mac moves without a packet generator.
 
 usage: mac.sh { add | del | replace } { bridge-port } { vlan-id } { static | dynamic } { /path/to/mac/file }
+
+
+set_tunnel_sip.py
+-------------
+Descriptions:
+  - Manually sets the Source IP of the hardware tunnel on Mellanox switches.
+  - sx_sdk allows only a single tunnel construct for all VNIs carried over
+    VXLAN.  This script calls the python SDK to manually set the SIP attribute
+    of the single tunnel construct.
+
+usage: set_tunnel_sip.py [-h] [-t TUNNEL_ID] -s NEW_SIP
+
+required arguments:
+  -s			new underlay source ip
+
+optional arguments:
+  -t			SDK tunnel id (in hex, defaults to 0x8c00000)
+
+examples:
+  - Set SIP to 222.222.222.222
+  # ./set_tunnel_sip.py -s 222.222.222.222
