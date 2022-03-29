@@ -65,6 +65,20 @@ Descriptions:
 usage: mac.sh { add | del | replace } { bridge-port } { vlan-id } { static | dynamic } { /path/to/mac/file }
 
 
+punt_everything.py
+------------------
+Descriptions:
+  - Creates an ACL entry in TCAM on Broadcom platforms with an action
+    of CopyToCpu.  This results in all transit packets being punted to
+    CPU.  Generally this isn't useful, but I once had a customer request
+    CPU-forwarded traffic so they could implement TC rules to inject delay,
+    so I created this script to make it easy for them.
+  - Known to cause duplicate traffic on the wire for L3 flows
+
+usage: punt_everything.py [{show | remove} entry_id]
+  - running with no arguments will install a new punt entry into the fp.
+
+
 set_tunnel_sip.py
 -------------
 Descriptions:
