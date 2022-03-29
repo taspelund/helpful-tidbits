@@ -1,0 +1,16 @@
+treysh.c
+--------
+Descriptions:
+  - treysh.c is a basic shell implementation written in C.
+    It features a handful of builtins along with piping support, with
+    no arbitrary limit on the number of pipes that can be used.
+
+Instructions:
+  - Build with your favorite C compiler, e.g. "gcc ./treysh.c -o treysh".
+  - Start shell with ./treysh
+
+Builtins:
+  - cd
+  - clear
+  - exit
+  - help
