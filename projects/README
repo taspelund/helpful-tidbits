@@ -1,5 +1,5 @@
-treysh.c
---------
+treysh-c/
+---------
 Descriptions:
   - treysh.c is a basic shell implementation written in C.
     It features a handful of builtins along with piping support, with
@@ -14,3 +14,17 @@ Builtins:
   - clear
   - exit
   - help
+
+treysh-rs/
+----------
+Descriptions:
+  - treysh.rs is a basic shell implementation written in Rust.
+    Much like treysh.c, it features a couple builtins and support for
+    piping an arbitrary number of commands.
+
+Instructions:
+  - Build and run with Cargo, e.g. "cargo run"
+
+Builtins:
+  - exit
+  - quit
