@@ -26,24 +26,24 @@ fn main() {
                 "exit" => return,
                 "quit" => return,
                 cmd => {
-                    // Choose source of stdin
-                    let stdin = match last_cmd {
-                        // use stdout from left side of pipe
+                    let input = match last_cmd {
+                        // stdout from last cmd
                         Some(mut last_c) => Stdio::from(last_c.stdout.take().unwrap()),
-                        // use stdin from parent (default)
+                        // stdin of parent (default)
                         None => Stdio::inherit(),
                     };
-                    // Choose destination of stdout
-                    let stdout = match commands.peek() {
-                        // stdin(Stdio::from(<stuff>))
-                        Some(_next) => Stdio::piped(),
+
+                    let output = match commands.peek() {
+                        // stdin of next cmd
+                        Some(_) => Stdio::piped(),
+                        // stdout of parent (default)
                         None => Stdio::inherit(),
                     };
 
                     last_cmd = match Command::new(cmd)
                         .args(args)
-                        .stdin(stdin)
-                        .stdout(stdout)
+                        .stdin(input)
+                        .stdout(output)
                         .spawn()
                     {
                         Ok(child) => Some(child),
