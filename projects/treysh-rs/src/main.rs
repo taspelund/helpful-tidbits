@@ -1,9 +1,49 @@
+use std::env::{current_dir, set_current_dir};
 use std::io;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
+macro_rules! help_text {
+    () => {
+        "Enter program names and arguments and hit enter to execute.
+The following ar built into treysh:
+  - cd
+  - clear
+  - exit
+  - help
+  - pwd
+  - quit
+"
+    };
+}
+
+macro_rules! help {
+    () => {
+        println!(help_text!())
+    };
+}
+
+macro_rules! welcome {
+    () => {
+        println!("Welcome to Trey Aspelund's treysh-rs!\n")
+    };
+}
+
+macro_rules! ascii_clear {
+    /*
+      Print ANSI control sequence to clear screen.
+        1B = ANSI ESC char
+        [H = Move Cursor to Row 1, Column 1
+        [J = Clear entire screen
+    */
+    () => {
+        print!("\x1B[H\x1B[J")
+    };
+}
+
 fn main() {
     let mut input = String::new();
+    welcome!();
 
     loop {
         print!("--> ");
@@ -23,7 +63,18 @@ fn main() {
             let cmd = args.next().unwrap();
 
             match cmd {
+                "cd" => match set_current_dir(args.next().unwrap()) {
+                    Ok(_) => (),
+                    Err(e) => eprintln!("{e}"),
+                },
+                "clear" => ascii_clear!(),
                 "exit" => return,
+                "help" => help!(),
+                "pwd" => {
+                    if let Ok(wd) = current_dir() {
+                        println!("{}", wd.display());
+                    }
+                }
                 "quit" => return,
                 cmd => {
                     let input = match last_cmd {

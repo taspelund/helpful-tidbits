@@ -26,5 +26,9 @@ Instructions:
   - Build and run with Cargo, e.g. "cargo run"
 
 Builtins:
+  - cd
+  - clear
   - exit
+  - help
+  - pwd
   - quit
