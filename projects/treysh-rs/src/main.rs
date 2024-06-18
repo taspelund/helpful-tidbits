@@ -14,7 +14,7 @@ fn main() {
         }
 
         // split by pipe to get individual commands
-        let mut commands = input.trim_end().split_terminator("|").peekable();
+        let mut commands = input.trim_end().split_terminator('|').peekable();
         let mut last_cmd: Option<Child> = None;
 
         // loop over all commands that aren't None
@@ -55,8 +55,8 @@ fn main() {
                 }
             }
         }
-        if last_cmd.is_some() {
-            let _ = last_cmd.unwrap().wait();
+        if let Some(mut c) = last_cmd {
+            let _ = c.wait();
         }
         input.clear();
     }
