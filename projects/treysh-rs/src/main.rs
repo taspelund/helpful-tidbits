@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 macro_rules! help_text {
     () => {
         "Enter program names and arguments and hit enter to execute.
-The following ar built into treysh:
+The following builtins are provided:
   - cd
   - clear
   - exit
