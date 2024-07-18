@@ -1,7 +1,7 @@
 use std::env::{current_dir, set_current_dir};
-use std::io;
-use std::io::Write;
-use std::process::{Child, Command, Stdio};
+use std::fs::File;
+use std::io::{self, BufRead, Write};
+use std::process::{self, Child, Command, Stdio};
 
 macro_rules! help_text {
     () => {
@@ -11,6 +11,7 @@ The following builtins are provided:
   - clear
   - exit
   - help
+  - memdump
   - pwd
   - quit
 "
@@ -38,6 +39,65 @@ macro_rules! ascii_clear {
     */
     () => {
         print!("\x1B[H\x1B[J")
+    };
+}
+
+fn hexdump_range(start: usize, stop: usize) {
+    let b = start as *const u8;
+    let e = stop as *const u8;
+    let mut i: isize = 0;
+    unsafe {
+        while b.offset(i) < e {
+            if i % 16 == 0 {
+                if i > 15 {
+                    println!();
+                }
+                print!("[{:p}]  ", b.offset(i));
+            }
+            print!("{:02X} ", *(b.offset(i)));
+            i += 1;
+        }
+        println!();
+    }
+}
+
+fn get_matching_memrange(pid: u32, pattern: &str) -> Option<(usize, usize)> {
+    let file = File::open(format!("/proc/{}/maps", pid)).unwrap();
+    let procbuf = io::BufReader::new(file);
+
+    /*
+    Example /proc/<pid>/maps output:
+       % grep 'heap\|stack' /proc/$$/maps
+       b61378cd6000-b61378fbc000 rw-p 00000000 00:00 0                          [heap]
+       fffff9c0a000-fffff9c83000 rw-p 00000000 00:00 0                          [stack]
+    */
+    for line in procbuf.lines().map(|l| l.unwrap()) {
+        if line.contains(pattern) {
+            // get first column: <begin_addr>-<end_addr>
+            let splits = line.split_whitespace().next().unwrap();
+            // get iterator of those two
+            let mut addrs = splits.split_terminator('-');
+            let begin_addr = usize::from_str_radix(addrs.next().unwrap(), 16).unwrap();
+            let end_addr = usize::from_str_radix(addrs.next().unwrap(), 16).unwrap();
+            return Some((begin_addr, end_addr));
+        }
+    }
+    None
+}
+
+fn get_self_meminfo() {
+    let pid: u32 = process::id();
+
+    println!("\n[stack]");
+    match get_matching_memrange(pid, "[stack]") {
+        Some((b, e)) => hexdump_range(b, e),
+        None => eprintln!("Cannot find meminfo for stack"),
+    };
+
+    println!("\n[heap]");
+    match get_matching_memrange(pid, "[heap]") {
+        Some((b, e)) => hexdump_range(b, e),
+        None => eprintln!("Cannot find meminfo for heap"),
     };
 }
 
@@ -70,6 +130,7 @@ fn main() {
                 "clear" => ascii_clear!(),
                 "exit" => return,
                 "help" => help!(),
+                "memdump" => get_self_meminfo(),
                 "pwd" => {
                     if let Ok(wd) = current_dir() {
                         println!("{}", wd.display());
