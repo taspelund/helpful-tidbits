@@ -1,7 +1,15 @@
 use std::env::{current_dir, set_current_dir};
+use std::io::{self, Write};
+use std::process::{Child, Command, Stdio};
+
+#[cfg(target_os = "linux")]
 use std::fs::File;
-use std::io::{self, BufRead, Write};
-use std::process::{self, Child, Command, Stdio};
+
+#[cfg(target_os = "linux")]
+use std::io::BufRead;
+
+#[cfg(target_os = "linux")]
+use std::process;
 
 macro_rules! help_text {
     () => {
@@ -42,6 +50,13 @@ macro_rules! ascii_clear {
     };
 }
 
+macro_rules! unsupported {
+    () => {
+        println!("feature not supported on this platform");
+    };
+}
+
+#[cfg(target_os = "linux")]
 fn hexdump_range(start: usize, stop: usize) {
     let b = start as *const u8;
     let e = stop as *const u8;
@@ -61,6 +76,7 @@ fn hexdump_range(start: usize, stop: usize) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn get_matching_memrange(pid: u32, pattern: &str) -> Option<(usize, usize)> {
     let file = File::open(format!("/proc/{}/maps", pid)).unwrap();
     let procbuf = io::BufReader::new(file);
@@ -85,6 +101,7 @@ fn get_matching_memrange(pid: u32, pattern: &str) -> Option<(usize, usize)> {
     None
 }
 
+#[cfg(target_os = "linux")]
 fn get_self_meminfo() {
     let pid: u32 = process::id();
 
@@ -99,6 +116,11 @@ fn get_self_meminfo() {
         Some((b, e)) => hexdump_range(b, e),
         None => eprintln!("Cannot find meminfo for heap"),
     };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_self_meminfo() {
+    unsupported!();
 }
 
 fn main() {
