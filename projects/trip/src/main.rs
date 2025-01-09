@@ -1,12 +1,10 @@
-use deku::{
-    prelude::{DekuRead, DekuWrite},
-    DekuContainerRead, DekuContainerWrite,
-};
+use serde::{Deserialize, Serialize};
 use socket2::{self, Domain, InterfaceIndexOrAddress, SockAddr, Socket, Type};
 use std::{
     env,
     ffi::CString,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
+    str::FromStr,
 };
 
 const RIPV2_PORT: u16 = 520;
@@ -20,56 +18,188 @@ const RIPNG_BIND: SocketAddr =
 const RIPNG_GROUP: Ipv6Addr = Ipv6Addr::new(0xff02, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x9);
 const RIPNG_DEST: SocketAddr = SocketAddr::V6(SocketAddrV6::new(RIPNG_GROUP, RIPNG_PORT, 0, 0));
 
-// internal version indicator
-enum ProtoVersion {
-    RIPv2,
-    RIPng,
-}
-
+// XXX: query link MTU from kernel
+const ASSUMED_MTU: usize = 1500;
+const IPV4_HEADER_LEN: usize = 20;
+const IPV6_HEADER_LEN: usize = 40;
+const UDP_HEADER_LEN: usize = 8;
 const RIP_HEADER_LEN: usize = 4;
+const RIP_PKT_MAX_LEN: usize =
+    (ASSUMED_MTU - IPV4_HEADER_LEN - UDP_HEADER_LEN - RIP_HEADER_LEN) / RIP_RTE_LEN;
+const RIPNG_PKT_MAX_LEN: usize =
+    (ASSUMED_MTU - IPV6_HEADER_LEN - UDP_HEADER_LEN - RIP_HEADER_LEN) / RIP_RTE_LEN;
 //  0                   1                   2                   3
 //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |  command (1)  |  version (1)  |       must be zero (2)        |
-// +---------------+---------------+-------------------------------+
-#[derive(Debug, DekuRead, DekuWrite)]
-#[deku(endian = "big")]
-struct RipHeader {
-    cmd: u8,
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                                                               |
+// ~                Route Table Entry 1 (20)                       ~
+// |                                                               |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                                                               |
+// ~                         ...                                   ~
+// |                                                               |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                                                               |
+// ~                Route Table Entry N (20)                       ~
+// |                                                               |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// XXX: use enum for cmd/ver? or convert RipCommand / RipVersion to consts?
+// maybe add truct RipPacketWire w/ u{8,16}, using methods to convert
+// between RipPacket and RipPacketWire?
+#[derive(Debug, Serialize, Deserialize)]
+struct RipPacket {
+    cmd: u8, // header start
     ver: u8,
     mbz: u16,
+    rt_entries: Vec<RouteTableEntry>, // payload
+}
+
+impl RipPacket {
+    fn new(cmd: RipCommand, proto: RipVersion, rt_entries: Vec<RouteTableEntry>) -> RipPacket {
+        Self {
+            cmd: cmd as u8,
+            ver: match proto {
+                RipVersion::RIP => proto as u8,
+                RipVersion::RIPng => proto as u8,
+            },
+            mbz: 0u16,
+            rt_entries,
+        }
+    }
+}
+
+impl std::fmt::Display for RipPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cmd_str = match self.cmd {
+            1 => Some("Request"),
+            2 => Some("Response"),
+            _ => None,
+        };
+        write!(
+            f,
+            "RipPacket {{\n\tcmd: {},\n\tver: 0x{:x},\n\tmbz: 0x{:x},\n\trt_entries: (\n{}\n\t)\n}}",
+            match cmd_str {
+                Some(s) => s.to_string(),
+                None => self.cmd.to_string(),
+            },
+            self.ver,
+            self.mbz,
+            self.rt_entries
+                .iter()
+                .map(|rte| format!("\t\t[{rte}]"))
+                .collect::<Vec<_>>()
+                .join(",\n")
+        )
+    }
 }
 
 /// RIP message type
+#[derive(PartialEq, Eq)]
 enum RipCommand {
     Request = 1,
     Response = 2,
 }
 
-/// RIP protocol version (in RIP header)
-enum RipV2Version {
-    RIPv1 = 1,
-    RIPv2 = 2,
-}
-
-/// RIPng protocol version (in RIP header)
-enum RipNgVersion {
+/// RIP/RIPng version numbers
+#[derive(PartialEq, Eq)]
+enum RipVersion {
+    RIP = 2,
     RIPng = 1,
 }
 
-/// RIPv2 Route Entry Types
-enum RipV2Rte {
-    Prefix(RipV2RtePrefix),
-    Authentication(RipV2RtePrefix),
-}
-
 /// RIPv2 Address-Family Identifiers
+#[derive(PartialEq, Eq)]
 enum RipV2AddressFamily {
     Inet = 0x0002,
     Auth = 0xFFFF,
 }
 
+/// RIPv2 Authentication Types
+#[derive(PartialEq, Eq)]
+enum RipV2AuthType {
+    Password = 0x0002,
+}
+
+/// Route Table Entry Types
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum RouteTableEntry {
+    Ipv4Prefix(Rte4Prefix),
+    Ipv4Authentication(Rte4Auth),
+    Ipv6Prefix(Rte6Prefix),
+    Ipv6Nexthop(Rte6Nexthop),
+}
+
+impl std::fmt::Display for RouteTableEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RouteTableEntry::Ipv4Prefix(prefix4) => {
+                let afi_str = match prefix4.afi {
+                    0x0002 => Some("AF_INET"),
+                    0xFFFF => Some("AF_AUTH"),
+                    _ => None,
+                };
+                write!(
+                    f,
+                    "Rte4Prefix {{ afi: {}, tag: {}, addr: {}, mask: {}, nh: {}, metric: {} }}",
+                    match afi_str {
+                        Some(s) => s.to_string(),
+                        None => prefix4.afi.to_string(),
+                    },
+                    prefix4.tag,
+                    Ipv4Addr::from_bits(prefix4.addr),
+                    Ipv4Addr::from_bits(prefix4.mask),
+                    Ipv4Addr::from_bits(prefix4.nh),
+                    prefix4.metric
+                )
+            }
+            RouteTableEntry::Ipv4Authentication(auth4) => {
+                // XXX: impl RipV2AddressFamily::try_from<u16> for this?
+                let afi_str = match auth4.afi {
+                    0x0002 => Some("AF_INET"),
+                    0xFFFF => Some("AF_AUTH"),
+                    _ => None,
+                };
+                write!(
+                    f,
+                    "Rte4Auth {{ afi: {}, auth_type: {}, pw: {:x?} }}",
+                    match afi_str {
+                        Some(s) => s.to_string(),
+                        None => auth4.afi.to_string(),
+                    },
+                    auth4.auth_type,
+                    auth4.pw,
+                )
+            }
+            RouteTableEntry::Ipv6Prefix(prefix6) => {
+                write!(
+                    f,
+                    "Rte6Prefix {{ pfx: {:x?}, tag: {}, pfx_len: {}, metric: {} }}",
+                    Ipv6Addr::from_bits(prefix6.pfx),
+                    prefix6.tag,
+                    prefix6.pfx_len,
+                    prefix6.metric
+                )
+            }
+            RouteTableEntry::Ipv6Nexthop(nexthop6) => {
+                write!(
+                    f,
+                    "Rte6Nexthop {{ nh: {:x?}, mbz1: {}, mbz2: {}, metric: {} }}",
+                    Ipv6Addr::from_bits(nexthop6.nh),
+                    nexthop6.mbz1,
+                    nexthop6.mbz2,
+                    nexthop6.metric,
+                )
+            }
+        }
+    }
+}
+
+// All RTEs are the same length, across all types/versions
 const RIP_RTE_LEN: usize = 20;
+
+/// RIPv2 Standard Route Entry: contains prefix.
 //  0                   1                   2                   3 3
 //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -83,8 +213,8 @@ const RIP_RTE_LEN: usize = 20;
 // +---------------------------------------------------------------+
 // |                         Metric (4)                            |
 // +---------------------------------------------------------------+
-/// RIPv2 Standard Route Entry: contains prefix.
-struct RipV2RtePrefix {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Rte4Prefix {
     afi: u16,  // 2 bytes
     tag: u16,  // + 2 bytes = 4
     addr: u32, // + 4 bytes = 8
@@ -94,11 +224,7 @@ struct RipV2RtePrefix {
     metric: u32, // + 4 bytes = 20
 }
 
-/// RIPv2 Authentication Types
-enum RipV2AuthType {
-    Password = 0x0002,
-}
-
+/// RIPv2 Authentication Route Entry: contains auth instead of prefix, AFI = 0xFFFF
 //  0                   1                   2                   3 3
 //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -108,19 +234,14 @@ enum RipV2AuthType {
 // +-------------------------------+-------------------------------+
 // ~                       Authentication (16)                     ~
 // +---------------------------------------------------------------+
-/// RIPv2 Authentication Route Entry: contains auth instead of prefix, AFI = 0xFFFF
-struct RipV2RteAuth {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Rte4Auth {
     afi: u16,
     auth_type: u16,
     pw: [u8; 16],
 }
 
-/// RIPng Route Entry Types
-enum RipNgRte {
-    Prefix(RipNgRtePrefix),
-    Nexthop(RipNgRteNexthop),
-}
-
+/// RIPng Standard Route Entry: contains prefix.
 //  0                   1                   2                   3
 //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -130,14 +251,15 @@ enum RipNgRte {
 // +---------------------------------------------------------------+
 // |         route tag (2)         | prefix len (1)|  metric (1)   |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// RIPng Standard Route Entry: contains prefix.
-struct RipNgRtePrefix {
-    pfx: [u8; 16],
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Rte6Prefix {
+    pfx: u128,
     tag: u16,
-    len: u8,
-    met: u8,
+    pfx_len: u8,
+    metric: u8,
 }
 
+/// RIPng Standard Route Entry: contains next hop, metric = 0xFF
 //  0                   1                   2                   3
 //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -147,9 +269,9 @@ struct RipNgRtePrefix {
 // +---------------------------------------------------------------+
 // |        must be zero (2)       |must be zero(1)|     0xFF      |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// RIPng Standard Route Entry: contains next hop, metric = 0xFF
-struct RipNgRteNexthop {
-    nh: [u8; 16],
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Rte6Nexthop {
+    nh: u128,
     mbz1: u16,
     mbz2: u8,
     metric: u8, // always set to u8::MAX
@@ -165,10 +287,10 @@ fn ifname_to_ifindex(ifname: &str) -> Result<u32, std::ffi::NulError> {
     Ok(ifindex)
 }
 
-fn init_rip_sock(ver: ProtoVersion, ifname: &str) -> std::io::Result<Socket> {
+fn init_rip_sock(ver: RipVersion, ifname: &str) -> std::io::Result<Socket> {
     let ifindex = ifname_to_ifindex(ifname)?;
     match ver {
-        ProtoVersion::RIPv2 => {
+        RipVersion::RIP => {
             let ripv2_sock = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
             ripv2_sock.set_reuse_address(true)?;
             ripv2_sock.bind_device(Some(ifname.as_bytes()))?;
@@ -184,7 +306,7 @@ fn init_rip_sock(ver: ProtoVersion, ifname: &str) -> std::io::Result<Socket> {
             // ripv2_sock.connect(&SockAddr::from(RIPV2_DEST))?;
             Ok(ripv2_sock)
         }
-        ProtoVersion::RIPng => {
+        RipVersion::RIPng => {
             let ripng_sock = Socket::new(Domain::IPV6, Type::DGRAM, None)?;
             ripng_sock.set_only_v6(true)?;
             ripng_sock.set_reuse_address(true)?;
@@ -203,17 +325,22 @@ fn init_rip_sock(ver: ProtoVersion, ifname: &str) -> std::io::Result<Socket> {
     }
 }
 
-fn listen_rip_sock(ver: ProtoVersion, sock: &UdpSocket) {
+fn listen_rip_sock(ver: RipVersion, sock: &UdpSocket) {
     let mut buf = [0u8; 4096];
     println!(
         "listening for {} on {}",
         match ver {
-            ProtoVersion::RIPv2 => "RIPv2",
-            ProtoVersion::RIPng => "RIPng",
+            RipVersion::RIP => "RIPv2",
+            RipVersion::RIPng => "RIPng",
         },
         sock.local_addr().unwrap(),
     );
+    let max_len = match ver {
+        RipVersion::RIP => RIP_PKT_MAX_LEN,
+        RipVersion::RIPng => RIPNG_PKT_MAX_LEN,
+    };
     loop {
+        buf.fill(0);
         if let Ok((rx_bytes, src_addr)) = sock.recv_from(&mut buf) {
             if rx_bytes < RIP_HEADER_LEN {
                 println!("data too short");
@@ -225,49 +352,54 @@ fn listen_rip_sock(ver: ProtoVersion, sock: &UdpSocket) {
                 );
                 continue;
             }
-            match RipHeader::from_bytes((&buf, 0)) {
-                Ok((_remaining, rip_header)) => {
-                    println!("rx rip pkt from {}: {:?}", src_addr.to_string(), rip_header)
+            // XXX: set buf len to RIP_PKG_MAX_LEN to enforce upper bounds?
+            if rx_bytes > max_len {
+                println!("data too large");
+                println!(
+                    "rx {} bytes from {} -> {:x?}",
+                    rx_bytes,
+                    src_addr.to_string(),
+                    &buf[0..rx_bytes]
+                );
+                continue;
+            }
+            match bincode::deserialize::<RipPacket>(&buf) {
+                Ok(rip_pkt) => {
+                    println!(
+                        "rx rip pkt ({} bytes) from {}:\n{}\n",
+                        rx_bytes,
+                        src_addr.to_string(),
+                        rip_pkt
+                    )
                 }
                 Err(_e) => {
                     eprintln!("failed to parse rx bytes!");
-                    break;
+                    continue;
                 }
             }
         } else {
             eprintln!("failed to read from listening socket!");
             break;
         }
-        buf.fill(0);
     }
 }
 
-fn send_rip_sock(ver: ProtoVersion, sock: &UdpSocket, msg: &[u8]) {
+fn send_rip_sock(ver: RipVersion, sock: &UdpSocket, rp: RipPacket) {
     let dst = match ver {
-        ProtoVersion::RIPv2 => &RIPV2_DEST,
-        ProtoVersion::RIPng => &RIPNG_DEST,
+        RipVersion::RIP => &RIPV2_DEST,
+        RipVersion::RIPng => &RIPNG_DEST,
     };
+    let msg = bincode::serialize(&rp).unwrap();
     // use send_to() instead of send() because the socket isn't connect()'d
-    if let Ok(bytes_sent) = sock.send_to(msg, &dst) {
+    if let Ok(bytes_sent) = sock.send_to(&msg, &dst) {
         println!(
-            "{} bytes sent from {} to {}",
+            "tx rip pkt ({} bytes) from {} to {}:\n{}\n",
             bytes_sent,
             sock.local_addr().unwrap(),
-            dst.to_string()
+            dst.to_string(),
+            rp
         );
     }
-}
-
-fn build_rip_header(ver: ProtoVersion, cmd: RipCommand) -> Vec<u8> {
-    let rip_header = RipHeader {
-        cmd: cmd as u8,
-        ver: match ver {
-            ProtoVersion::RIPv2 => RipV2Version::RIPv2 as u8,
-            ProtoVersion::RIPng => RipNgVersion::RIPng as u8,
-        },
-        mbz: 0 as u16,
-    };
-    rip_header.to_bytes().unwrap()
 }
 
 const HELP: &str = "trip {sender <ifname> <msg> | listener <ifname>}";
@@ -285,47 +417,64 @@ fn main() -> std::io::Result<()> {
     match env::args().nth(1) {
         Some(mode) => match mode.as_str() {
             "sender" => {
-                let message = match env::args().nth(3) {
-                    Some(msg) => msg,
-                    None => {
-                        eprintln!("msg is a required argument for sender!");
-                        eprintln!("{}", HELP);
-                        return Ok(());
-                    }
-                };
+                let ripv2_tx: UdpSocket = init_rip_sock(RipVersion::RIP, &ifname)?.into();
+                let ripng_tx: UdpSocket = init_rip_sock(RipVersion::RIPng, &ifname)?.into();
 
-                let ripv2_tx: UdpSocket = init_rip_sock(ProtoVersion::RIPv2, &ifname)?.into();
-                let ripng_tx: UdpSocket = init_rip_sock(ProtoVersion::RIPng, &ifname)?.into();
+                let rte4_list = vec![
+                    RouteTableEntry::Ipv4Prefix(Rte4Prefix {
+                        afi: RipV2AddressFamily::Inet as u16,
+                        tag: 50_u16,
+                        addr: Ipv4Addr::from_str("10.0.0.0").unwrap().to_bits(),
+                        mask: Ipv4Addr::from_str("255.0.0.0").unwrap().to_bits(),
+                        nh: Ipv4Addr::from_str("192.168.0.1").unwrap().to_bits(),
+                        metric: 5_u32,
+                    }),
+                    RouteTableEntry::Ipv4Authentication(Rte4Auth {
+                        afi: RipV2AddressFamily::Auth as u16,
+                        auth_type: RipV2AuthType::Password as u16,
+                        pw: [0u8; 16],
+                    }),
+                ];
+                let rte6_list = vec![
+                    RouteTableEntry::Ipv6Nexthop(Rte6Nexthop {
+                        nh: Ipv6Addr::from_str("2001:db8:cafe::beef:face")
+                            .unwrap()
+                            .to_bits(),
+                        mbz1: 0_u16,
+                        mbz2: 0_u8,
+                        metric: 12_u8,
+                    }),
+                    RouteTableEntry::Ipv6Prefix(Rte6Prefix {
+                        pfx: Ipv6Addr::from_str("2001:db8:cafe::dead:beef")
+                            .unwrap()
+                            .to_bits(),
+                        tag: 60_u16,
+                        pfx_len: 64_u8,
+                        metric: 9_u8,
+                    }),
+                ];
 
-                match message.as_str() {
-                    "rip" => {
-                        let buf = build_rip_header(ProtoVersion::RIPv2, RipCommand::Request);
-                        send_rip_sock(ProtoVersion::RIPv2, &ripv2_tx, &buf);
-                        let buf = build_rip_header(ProtoVersion::RIPv2, RipCommand::Response);
-                        send_rip_sock(ProtoVersion::RIPv2, &ripv2_tx, &buf);
-                        let buf = build_rip_header(ProtoVersion::RIPng, RipCommand::Request);
-                        send_rip_sock(ProtoVersion::RIPng, &ripng_tx, &buf);
-                        let buf = build_rip_header(ProtoVersion::RIPng, RipCommand::Response);
-                        send_rip_sock(ProtoVersion::RIPng, &ripng_tx, &buf);
-                    }
-                    _ => {
-                        let msg = &message.as_bytes();
-                        send_rip_sock(ProtoVersion::RIPv2, &ripv2_tx, msg);
-                        send_rip_sock(ProtoVersion::RIPng, &ripng_tx, msg);
-                    }
-                }
+                let rp = RipPacket::new(RipCommand::Request, RipVersion::RIP, rte4_list.clone());
+                send_rip_sock(RipVersion::RIP, &ripv2_tx, rp);
+                let rp = RipPacket::new(RipCommand::Response, RipVersion::RIP, rte4_list.clone());
+                send_rip_sock(RipVersion::RIP, &ripv2_tx, rp);
+
+                let rp = RipPacket::new(RipCommand::Request, RipVersion::RIPng, rte6_list.clone());
+                send_rip_sock(RipVersion::RIPng, &ripng_tx, rp);
+                let rp = RipPacket::new(RipCommand::Response, RipVersion::RIPng, rte6_list.clone());
+                send_rip_sock(RipVersion::RIPng, &ripng_tx, rp);
             }
             "listener" => {
                 // convert from socket2 -> std::net to simplify our buffer implementation.
                 // i.e. [MaybeUninit<u8>] seems more restrictive than [u8], so drop it.
-                let ripv2_sock: UdpSocket = init_rip_sock(ProtoVersion::RIPv2, &ifname)?.into();
+                let ripv2_sock: UdpSocket = init_rip_sock(RipVersion::RIP, &ifname)?.into();
                 let ripv2_thread = std::thread::spawn(move || {
-                    listen_rip_sock(ProtoVersion::RIPv2, &ripv2_sock);
+                    listen_rip_sock(RipVersion::RIP, &ripv2_sock);
                 });
 
-                let ripng_sock: UdpSocket = init_rip_sock(ProtoVersion::RIPng, &ifname)?.into();
+                let ripng_sock: UdpSocket = init_rip_sock(RipVersion::RIPng, &ifname)?.into();
                 let ripng_thread = std::thread::spawn(move || {
-                    listen_rip_sock(ProtoVersion::RIPng, &ripng_sock);
+                    listen_rip_sock(RipVersion::RIPng, &ripng_sock);
                 });
 
                 ripv2_thread.join().unwrap();
