@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+deku = "0.18.1"
 libc = "0.2.169"
+serde = { version = "1.0.217", features = ["derive"] }
 socket2 = { version = "0.5.7", features = ["all"] }
