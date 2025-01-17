@@ -1,23 +1,25 @@
-use serde::{Deserialize, Serialize};
+use byteorder::{BigEndian, ReadBytesExt};
 use socket2::{self, Domain, InterfaceIndexOrAddress, SockAddr, Socket, Type};
 use std::{
     env,
     ffi::CString,
+    io::Cursor,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
     str::FromStr,
 };
 
+/// Constants for RIPv2 sockets
 const RIPV2_PORT: u16 = 520;
 const RIPV2_BIND: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, RIPV2_PORT));
 const RIPV2_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 9);
 const RIPV2_DEST: SocketAddr = SocketAddr::V4(SocketAddrV4::new(RIPV2_GROUP, RIPV2_PORT));
-
+/// Constants for RIPng sockets
 const RIPNG_PORT: u16 = 521;
 const RIPNG_BIND: SocketAddr =
     SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, RIPNG_PORT, 0, 0));
 const RIPNG_GROUP: Ipv6Addr = Ipv6Addr::new(0xff02, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x9);
 const RIPNG_DEST: SocketAddr = SocketAddr::V6(SocketAddrV6::new(RIPNG_GROUP, RIPNG_PORT, 0, 0));
-
+/// Constants for header lengths and packet sizes
 // XXX: query link MTU from kernel
 const ASSUMED_MTU: usize = 1500;
 const IPV4_HEADER_LEN: usize = 20;
@@ -25,9 +27,10 @@ const IPV6_HEADER_LEN: usize = 40;
 const UDP_HEADER_LEN: usize = 8;
 const RIP_HEADER_LEN: usize = 4;
 const RIP_PKT_MAX_LEN: usize =
-    (ASSUMED_MTU - IPV4_HEADER_LEN - UDP_HEADER_LEN - RIP_HEADER_LEN) / RIP_RTE_LEN;
+    (ASSUMED_MTU - IPV4_HEADER_LEN - UDP_HEADER_LEN - RIP_HEADER_LEN) / RouteTableEntry::SIZE;
 const RIPNG_PKT_MAX_LEN: usize =
-    (ASSUMED_MTU - IPV6_HEADER_LEN - UDP_HEADER_LEN - RIP_HEADER_LEN) / RIP_RTE_LEN;
+    (ASSUMED_MTU - IPV6_HEADER_LEN - UDP_HEADER_LEN - RIP_HEADER_LEN) / RouteTableEntry::SIZE;
+
 //  0                   1                   2                   3
 //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -45,28 +48,99 @@ const RIPNG_PKT_MAX_LEN: usize =
 // ~                Route Table Entry N (20)                       ~
 // |                                                               |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// XXX: use enum for cmd/ver? or convert RipCommand / RipVersion to consts?
-// maybe add truct RipPacketWire w/ u{8,16}, using methods to convert
-// between RipPacket and RipPacketWire?
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 struct RipPacket {
+    // XXX: go back to struct RipHeader
     cmd: u8, // header start
     ver: u8,
     mbz: u16,
-    rt_entries: Vec<RouteTableEntry>, // payload
+    rt_entries: Vec<RouteTableEntry>, // payload start
 }
 
 impl RipPacket {
-    fn new(cmd: RipCommand, proto: RipVersion, rt_entries: Vec<RouteTableEntry>) -> RipPacket {
+    fn new(cmd: RipCommand, proto: &RipVersion, rt_entries: Vec<RouteTableEntry>) -> RipPacket {
         Self {
             cmd: cmd as u8,
-            ver: match proto {
-                RipVersion::RIP => proto as u8,
-                RipVersion::RIPng => proto as u8,
-            },
+            ver: proto.to_u8(),
             mbz: 0u16,
             rt_entries,
         }
+    }
+
+    fn from_bytes(proto: &RipVersion, b: &[u8]) -> std::io::Result<Self> {
+        let mut cursor = Cursor::new(b);
+
+        let cmd = cursor.read_u8()?; // START HEADER
+        if cmd != RipCommand::Request.to_u8() && cmd != RipCommand::Response.to_u8() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Unsupported RIP command: {}", cmd),
+            ));
+        }
+
+        let ver = cursor.read_u8()?;
+        if ver != proto.to_u8() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid RIP version. Expected ({}), Received ({})",
+                    proto.to_u8(),
+                    ver
+                ),
+            ));
+        }
+
+        let mbz = cursor.read_u16::<BigEndian>()?;
+        if mbz != 0 {
+            // RFCs 2453 (RIPv2) and 2080 (RIPng) don't state what to do here.
+            // It seems sane to log this and otherwise ignore it.
+            eprintln!("must-be-zero field is not set to zero: {}", mbz);
+        } // END HEADER
+
+        let total_len = b.len();
+        let header_len = cursor.position() as usize;
+        let payload_len = total_len - header_len;
+        if payload_len % RouteTableEntry::SIZE != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid payload length. Payload must be a multiple of {}, found {}",
+                    RouteTableEntry::SIZE,
+                    payload_len
+                ),
+            ));
+        }
+
+        let num_rtes = payload_len / RouteTableEntry::SIZE;
+        let mut rt_entries: Vec<RouteTableEntry> = Vec::with_capacity(num_rtes);
+        for _ in 0..num_rtes {
+            let start = cursor.position() as usize;
+            let end = start + RouteTableEntry::SIZE;
+            let rte_bytes = &b[start..end];
+            match RouteTableEntry::from_bytes(proto, rte_bytes) {
+                Ok(rte) => rt_entries.push(rte),
+                Err(e) => eprintln!("Error parsing RTE: {e}"),
+            }
+            cursor.set_position(end as u64);
+        }
+
+        Ok(RipPacket {
+            cmd,
+            ver,
+            mbz,
+            rt_entries,
+        })
+    }
+
+    fn to_byte_vec(&self) -> Vec<u8> {
+        let mut b = Vec::<u8>::new();
+        b.push(self.cmd); // single byte, no order
+        b.push(self.ver); // single byte, no order
+        b.extend_from_slice(&self.mbz.to_be_bytes());
+        for rte in &self.rt_entries {
+            b.extend(rte.to_byte_vec());
+        }
+        b
     }
 }
 
@@ -96,17 +170,30 @@ impl std::fmt::Display for RipPacket {
 }
 
 /// RIP message type
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum RipCommand {
     Request = 1,
     Response = 2,
 }
 
+impl RipCommand {
+    fn to_u8(&self) -> u8 {
+        self.clone() as u8
+    }
+}
+
 /// RIP/RIPng version numbers
-#[derive(PartialEq, Eq)]
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Clone, PartialEq, Eq)]
 enum RipVersion {
     RIP = 2,
     RIPng = 1,
+}
+
+impl RipVersion {
+    fn to_u8(&self) -> u8 {
+        self.clone() as u8
+    }
 }
 
 /// RIPv2 Address-Family Identifiers
@@ -114,21 +201,168 @@ enum RipVersion {
 enum RipV2AddressFamily {
     Inet = 0x0002,
     Auth = 0xFFFF,
+    Unsupported,
+}
+
+impl RipV2AddressFamily {
+    fn from_u16(n: u16) -> Self {
+        match n {
+            0x0002 => Self::Inet,
+            0xFFFF => Self::Auth,
+            _ => Self::Unsupported,
+        }
+    }
+
+    fn to_u16(&self) -> u16 {
+        match self {
+            Self::Inet => 0x0002,
+            Self::Auth => 0xFFFF,
+            Self::Unsupported => 0x0,
+        }
+    }
 }
 
 /// RIPv2 Authentication Types
 #[derive(PartialEq, Eq)]
 enum RipV2AuthType {
     Password = 0x0002,
+    Unsupported,
+}
+
+impl RipV2AuthType {
+    fn from_u16(n: u16) -> Self {
+        match n {
+            0x0002 => Self::Password,
+            _ => Self::Unsupported,
+        }
+    }
+
+    fn to_u16(&self) -> u16 {
+        match self {
+            Self::Password => 0x0002,
+            Self::Unsupported => 0x0,
+        }
+    }
 }
 
 /// Route Table Entry Types
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 enum RouteTableEntry {
     Ipv4Prefix(Rte4Prefix),
     Ipv4Authentication(Rte4Auth),
     Ipv6Prefix(Rte6Prefix),
     Ipv6Nexthop(Rte6Nexthop),
+}
+
+impl RouteTableEntry {
+    // All RTEs are the same length, across all RTE types & Protocol versions
+    const SIZE: usize = 20;
+
+    fn from_bytes(ver: &RipVersion, b: &[u8]) -> std::io::Result<Self> {
+        let mut cursor = Cursor::new(b);
+        match ver {
+            RipVersion::RIP => {
+                let afi = cursor.read_u16::<BigEndian>()?;
+                match RipV2AddressFamily::from_u16(afi) {
+                    RipV2AddressFamily::Inet => {
+                        let tag = cursor.read_u16::<BigEndian>()?;
+                        // XXX: add sanity check for valid unicast prefix
+                        let addr = cursor.read_u32::<BigEndian>()?;
+                        let mask = cursor.read_u32::<BigEndian>()?;
+                        // XXX: add sanity check for valid unicast nh
+                        let nh = cursor.read_u32::<BigEndian>()?;
+                        // XXX: add sanity check for max RIP metric (16)
+                        let metric = cursor.read_u32::<BigEndian>()?;
+                        Ok(Self::Ipv4Prefix(Rte4Prefix {
+                            afi,
+                            tag,
+                            addr,
+                            mask,
+                            nh,
+                            metric,
+                        }))
+                    }
+                    RipV2AddressFamily::Auth => {
+                        // XXX: check for supported auth type
+                        let auth_type = cursor.read_u16::<BigEndian>()?;
+                        if RipV2AuthType::from_u16(auth_type) == RipV2AuthType::Unsupported {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Unsupported RIPv2 Authentication Type: {}", auth_type),
+                            ));
+                        }
+                        let pw = cursor.read_u128::<BigEndian>()?;
+                        Ok(Self::Ipv4Authentication(Rte4Auth { afi, auth_type, pw }))
+                    }
+                    RipV2AddressFamily::Unsupported => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Unsupported RIPv2 Address Family: {}", afi),
+                    )),
+                }
+            }
+            RipVersion::RIPng => {
+                // XXX: add sanity check for valid unicast prefix/nh
+                let addr = cursor.read_u128::<BigEndian>()?;
+                let tag = cursor.read_u16::<BigEndian>()?;
+                let plen = cursor.read_u8()?;
+                // XXX: add sanity check for max RIP metric (16)
+                let metric = cursor.read_u8()?;
+                match metric {
+                    // Metric is always 0xFF for Nexthop
+                    u8::MAX => Ok(Self::Ipv6Nexthop(Rte6Nexthop {
+                        nh: addr,
+                        mbz1: tag,
+                        mbz2: plen,
+                        metric,
+                    })),
+                    _ => Ok(Self::Ipv6Prefix(Rte6Prefix {
+                        pfx: addr,
+                        tag,
+                        pfx_len: plen,
+                        metric,
+                    })),
+                }
+            }
+        }
+    }
+
+    fn to_byte_vec(&self) -> Vec<u8> {
+        match self {
+            Self::Ipv4Prefix(prefix4) => {
+                let mut b = Vec::<u8>::new();
+                b.extend_from_slice(&prefix4.afi.to_be_bytes());
+                b.extend_from_slice(&prefix4.tag.to_be_bytes());
+                b.extend_from_slice(&prefix4.addr.to_be_bytes());
+                b.extend_from_slice(&prefix4.mask.to_be_bytes());
+                b.extend_from_slice(&prefix4.nh.to_be_bytes());
+                b.extend_from_slice(&prefix4.metric.to_be_bytes());
+                b
+            }
+            Self::Ipv4Authentication(auth4) => {
+                let mut b = Vec::<u8>::new();
+                b.extend_from_slice(&auth4.afi.to_be_bytes());
+                b.extend_from_slice(&auth4.auth_type.to_be_bytes());
+                b.extend_from_slice(&auth4.pw.to_be_bytes());
+                b
+            }
+            Self::Ipv6Prefix(prefix6) => {
+                let mut b = Vec::<u8>::new();
+                b.extend_from_slice(&prefix6.pfx.to_be_bytes());
+                b.extend_from_slice(&prefix6.tag.to_be_bytes());
+                b.extend_from_slice(&prefix6.pfx_len.to_be_bytes());
+                b.extend_from_slice(&prefix6.metric.to_be_bytes());
+                b
+            }
+            Self::Ipv6Nexthop(nexthop6) => {
+                let mut b = Vec::<u8>::new();
+                b.extend_from_slice(&nexthop6.nh.to_be_bytes());
+                b.extend_from_slice(&nexthop6.mbz1.to_be_bytes());
+                b.extend_from_slice(&nexthop6.mbz2.to_be_bytes());
+                b.extend_from_slice(&nexthop6.metric.to_be_bytes());
+                b
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for RouteTableEntry {
@@ -169,7 +403,7 @@ impl std::fmt::Display for RouteTableEntry {
                         None => auth4.afi.to_string(),
                     },
                     auth4.auth_type,
-                    auth4.pw,
+                    auth4.pw.to_be_bytes(),
                 )
             }
             RouteTableEntry::Ipv6Prefix(prefix6) => {
@@ -196,9 +430,6 @@ impl std::fmt::Display for RouteTableEntry {
     }
 }
 
-// All RTEs are the same length, across all types/versions
-const RIP_RTE_LEN: usize = 20;
-
 /// RIPv2 Standard Route Entry: contains prefix.
 //  0                   1                   2                   3 3
 //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -213,7 +444,7 @@ const RIP_RTE_LEN: usize = 20;
 // +---------------------------------------------------------------+
 // |                         Metric (4)                            |
 // +---------------------------------------------------------------+
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct Rte4Prefix {
     afi: u16,  // 2 bytes
     tag: u16,  // + 2 bytes = 4
@@ -234,11 +465,11 @@ struct Rte4Prefix {
 // +-------------------------------+-------------------------------+
 // ~                       Authentication (16)                     ~
 // +---------------------------------------------------------------+
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct Rte4Auth {
     afi: u16,
     auth_type: u16,
-    pw: [u8; 16],
+    pw: u128,
 }
 
 /// RIPng Standard Route Entry: contains prefix.
@@ -251,7 +482,7 @@ struct Rte4Auth {
 // +---------------------------------------------------------------+
 // |         route tag (2)         | prefix len (1)|  metric (1)   |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct Rte6Prefix {
     pfx: u128,
     tag: u16,
@@ -269,7 +500,7 @@ struct Rte6Prefix {
 // +---------------------------------------------------------------+
 // |        must be zero (2)       |must be zero(1)|     0xFF      |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct Rte6Nexthop {
     nh: u128,
     mbz1: u16,
@@ -325,55 +556,50 @@ fn init_rip_sock(ver: RipVersion, ifname: &str) -> std::io::Result<Socket> {
     }
 }
 
-fn listen_rip_sock(ver: RipVersion, sock: &UdpSocket) {
+fn listen_rip_sock(proto: &RipVersion, sock: &UdpSocket) {
     let mut buf = [0u8; 4096];
     println!(
         "listening for {} on {}",
-        match ver {
+        match proto {
             RipVersion::RIP => "RIPv2",
             RipVersion::RIPng => "RIPng",
         },
         sock.local_addr().unwrap(),
     );
-    let max_len = match ver {
+    let max_len = match proto {
         RipVersion::RIP => RIP_PKT_MAX_LEN,
         RipVersion::RIPng => RIPNG_PKT_MAX_LEN,
     };
     loop {
         buf.fill(0);
         if let Ok((rx_bytes, src_addr)) = sock.recv_from(&mut buf) {
+            println!(
+                "rx {} bytes from {} -> {:x?}",
+                rx_bytes,
+                src_addr,
+                &buf[0..rx_bytes]
+            );
+
             if rx_bytes < RIP_HEADER_LEN {
                 println!("data too short");
-                println!(
-                    "rx {} bytes from {} -> {:x?}",
-                    rx_bytes,
-                    src_addr.to_string(),
-                    &buf[0..rx_bytes]
-                );
                 continue;
             }
-            // XXX: set buf len to RIP_PKG_MAX_LEN to enforce upper bounds?
+
+            // XXX: set buf len to RIP_PKT_MAX_LEN to enforce upper bounds?
             if rx_bytes > max_len {
                 println!("data too large");
-                println!(
-                    "rx {} bytes from {} -> {:x?}",
-                    rx_bytes,
-                    src_addr.to_string(),
-                    &buf[0..rx_bytes]
-                );
                 continue;
             }
-            match bincode::deserialize::<RipPacket>(&buf) {
+
+            match RipPacket::from_bytes(proto, &buf[..rx_bytes]) {
                 Ok(rip_pkt) => {
                     println!(
                         "rx rip pkt ({} bytes) from {}:\n{}\n",
-                        rx_bytes,
-                        src_addr.to_string(),
-                        rip_pkt
+                        rx_bytes, src_addr, rip_pkt
                     )
                 }
-                Err(_e) => {
-                    eprintln!("failed to parse rx bytes!");
+                Err(e) => {
+                    eprintln!("failed to parse rx bytes! {e}");
                     continue;
                 }
             }
@@ -384,19 +610,18 @@ fn listen_rip_sock(ver: RipVersion, sock: &UdpSocket) {
     }
 }
 
-fn send_rip_sock(ver: RipVersion, sock: &UdpSocket, rp: RipPacket) {
+fn send_rip_sock(ver: &RipVersion, sock: &UdpSocket, rp: RipPacket) {
     let dst = match ver {
         RipVersion::RIP => &RIPV2_DEST,
         RipVersion::RIPng => &RIPNG_DEST,
     };
-    let msg = bincode::serialize(&rp).unwrap();
     // use send_to() instead of send() because the socket isn't connect()'d
-    if let Ok(bytes_sent) = sock.send_to(&msg, &dst) {
+    if let Ok(bytes_sent) = sock.send_to(&rp.to_byte_vec(), dst) {
         println!(
             "tx rip pkt ({} bytes) from {} to {}:\n{}\n",
             bytes_sent,
             sock.local_addr().unwrap(),
-            dst.to_string(),
+            dst,
             rp
         );
     }
@@ -418,7 +643,9 @@ fn main() -> std::io::Result<()> {
         Some(mode) => match mode.as_str() {
             "sender" => {
                 let ripv2_tx: UdpSocket = init_rip_sock(RipVersion::RIP, &ifname)?.into();
+                let ripv2_proto = RipVersion::RIP;
                 let ripng_tx: UdpSocket = init_rip_sock(RipVersion::RIPng, &ifname)?.into();
+                let ripng_proto = RipVersion::RIPng;
 
                 let rte4_list = vec![
                     RouteTableEntry::Ipv4Prefix(Rte4Prefix {
@@ -430,9 +657,9 @@ fn main() -> std::io::Result<()> {
                         metric: 5_u32,
                     }),
                     RouteTableEntry::Ipv4Authentication(Rte4Auth {
-                        afi: RipV2AddressFamily::Auth as u16,
-                        auth_type: RipV2AuthType::Password as u16,
-                        pw: [0u8; 16],
+                        afi: RipV2AddressFamily::Auth.to_u16(),
+                        auth_type: RipV2AuthType::Password.to_u16(),
+                        pw: 0u128,
                     }),
                 ];
                 let rte6_list = vec![
@@ -454,34 +681,39 @@ fn main() -> std::io::Result<()> {
                     }),
                 ];
 
-                let rp = RipPacket::new(RipCommand::Request, RipVersion::RIP, rte4_list.clone());
-                send_rip_sock(RipVersion::RIP, &ripv2_tx, rp);
-                let rp = RipPacket::new(RipCommand::Response, RipVersion::RIP, rte4_list.clone());
-                send_rip_sock(RipVersion::RIP, &ripv2_tx, rp);
+                let rp = RipPacket::new(RipCommand::Request, &ripv2_proto, rte4_list.clone());
+                send_rip_sock(&ripv2_proto, &ripv2_tx, rp);
+                let rp = RipPacket::new(RipCommand::Response, &ripv2_proto, rte4_list.clone());
+                send_rip_sock(&ripv2_proto, &ripv2_tx, rp);
 
-                let rp = RipPacket::new(RipCommand::Request, RipVersion::RIPng, rte6_list.clone());
-                send_rip_sock(RipVersion::RIPng, &ripng_tx, rp);
-                let rp = RipPacket::new(RipCommand::Response, RipVersion::RIPng, rte6_list.clone());
-                send_rip_sock(RipVersion::RIPng, &ripng_tx, rp);
+                let rp = RipPacket::new(RipCommand::Request, &ripng_proto, rte6_list.clone());
+                send_rip_sock(&ripng_proto, &ripng_tx, rp);
+                let rp = RipPacket::new(RipCommand::Response, &ripng_proto, rte6_list.clone());
+                send_rip_sock(&ripng_proto, &ripng_tx, rp);
             }
             "listener" => {
                 // convert from socket2 -> std::net to simplify our buffer implementation.
                 // i.e. [MaybeUninit<u8>] seems more restrictive than [u8], so drop it.
+                let ripv2_proto = RipVersion::RIP;
                 let ripv2_sock: UdpSocket = init_rip_sock(RipVersion::RIP, &ifname)?.into();
                 let ripv2_thread = std::thread::spawn(move || {
-                    listen_rip_sock(RipVersion::RIP, &ripv2_sock);
+                    listen_rip_sock(&ripv2_proto, &ripv2_sock);
                 });
 
+                let ripng_proto = RipVersion::RIPng;
                 let ripng_sock: UdpSocket = init_rip_sock(RipVersion::RIPng, &ifname)?.into();
                 let ripng_thread = std::thread::spawn(move || {
-                    listen_rip_sock(RipVersion::RIPng, &ripng_sock);
+                    listen_rip_sock(&ripng_proto, &ripng_sock);
                 });
 
                 ripv2_thread.join().unwrap();
                 ripng_thread.join().unwrap();
             }
             _ => {
-                return Ok(eprintln!("unsupported mode"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Unsupported run mode",
+                ));
             }
         },
         None => {
