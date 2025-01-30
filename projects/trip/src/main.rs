@@ -139,7 +139,7 @@ impl RipPacket {
         b.push(self.ver); // single byte, no order
         b.extend_from_slice(&self.mbz.to_be_bytes());
         for rte in &self.rt_entries {
-            b.extend(rte.to_byte_vec());
+            b.extend_from_slice(&rte.to_bytes());
         }
         b
     }
@@ -419,39 +419,36 @@ impl RouteTableEntry {
         }
     }
 
-    fn to_byte_vec(&self) -> Vec<u8> {
+    fn to_bytes(&self) -> [u8; RouteTableEntry::SIZE] {
+        let mut b = [0u8; RouteTableEntry::SIZE];
         match self {
             Self::Ipv4Prefix(prefix4) => {
-                let mut b = Vec::<u8>::new();
-                b.extend_from_slice(&prefix4.afi.to_u16().to_be_bytes());
-                b.extend_from_slice(&prefix4.tag.to_be_bytes());
-                b.extend_from_slice(&prefix4.addr.to_bits().to_be_bytes());
-                b.extend_from_slice(&prefix4.mask.to_be_bytes());
-                b.extend_from_slice(&prefix4.nh.to_bits().to_be_bytes());
-                b.extend_from_slice(&prefix4.metric.to_be_bytes());
+                b[0..=1].copy_from_slice(&prefix4.afi.to_u16().to_be_bytes());
+                b[2..=3].copy_from_slice(&prefix4.tag.to_be_bytes());
+                b[4..=7].copy_from_slice(&prefix4.addr.to_bits().to_be_bytes());
+                b[8..=11].copy_from_slice(&prefix4.mask.to_be_bytes());
+                b[12..=15].copy_from_slice(&prefix4.nh.to_bits().to_be_bytes());
+                b[16..=19].copy_from_slice(&prefix4.metric.to_be_bytes());
                 b
             }
             Self::Ipv4Authentication(auth4) => {
-                let mut b = Vec::<u8>::new();
-                b.extend_from_slice(&auth4.afi.to_u16().to_be_bytes());
-                b.extend_from_slice(&auth4.auth_type.to_u16().to_be_bytes());
-                b.extend_from_slice(&auth4.pw.to_be_bytes());
+                b[0..=1].copy_from_slice(&auth4.afi.to_u16().to_be_bytes());
+                b[2..=3].copy_from_slice(&auth4.auth_type.to_u16().to_be_bytes());
+                b[4..=19].copy_from_slice(&auth4.pw.to_be_bytes());
                 b
             }
             Self::Ipv6Prefix(prefix6) => {
-                let mut b = Vec::<u8>::new();
-                b.extend_from_slice(&prefix6.pfx.to_bits().to_be_bytes());
-                b.extend_from_slice(&prefix6.tag.to_be_bytes());
-                b.extend_from_slice(&prefix6.pfx_len.to_be_bytes());
-                b.extend_from_slice(&prefix6.metric.to_be_bytes());
+                b[0..=15].copy_from_slice(&prefix6.pfx.to_bits().to_be_bytes());
+                b[16..=17].copy_from_slice(&prefix6.tag.to_be_bytes());
+                b[18] = prefix6.pfx_len;
+                b[19] = prefix6.metric;
                 b
             }
             Self::Ipv6Nexthop(nexthop6) => {
-                let mut b = Vec::<u8>::new();
-                b.extend_from_slice(&nexthop6.nh.to_bits().to_be_bytes());
-                b.extend_from_slice(&nexthop6.mbz1.to_be_bytes());
-                b.extend_from_slice(&nexthop6.mbz2.to_be_bytes());
-                b.extend_from_slice(&nexthop6.metric.to_be_bytes());
+                b[0..=15].copy_from_slice(&nexthop6.nh.to_bits().to_be_bytes());
+                b[16..=17].copy_from_slice(&nexthop6.mbz1.to_be_bytes());
+                b[18] = nexthop6.mbz2;
+                b[19] = nexthop6.metric;
                 b
             }
         }
