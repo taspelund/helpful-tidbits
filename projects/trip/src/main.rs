@@ -1,11 +1,15 @@
 use byteorder::{BigEndian, ReadBytesExt};
+use ipnet::{Ipv4Net, Ipv6Net};
 use socket2::{self, Domain, InterfaceIndexOrAddress, SockAddr, Socket, Type};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::CString,
     io::Cursor,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
+    ops::DerefMut,
     str::FromStr,
+    sync::{Arc, Mutex},
 };
 
 /// Constants for `RIPv2` sockets
@@ -142,6 +146,24 @@ impl RipPacket {
             b.extend_from_slice(&rte.to_bytes());
         }
         b
+    }
+
+    fn process(&self, db: &mut RipDb) {
+        self.rt_entries.iter().for_each(|rte| match rte {
+            RouteTableEntry::Ipv4Prefix(r) => {
+                let mut nh_set = BTreeSet::new();
+                nh_set.insert(RipPathInfo {
+                    nh: IpAddr::V4(r.nh),
+                    ifindex: 0u32,
+                    metric: r.metric as u8,
+                    tag: r.tag,
+                });
+                db.ripv2_rib.insert(r.prefix().clone(), nh_set.clone());
+            }
+            RouteTableEntry::Ipv4Authentication(_) => (),
+            RouteTableEntry::Ipv6Prefix(_) => (),
+            RouteTableEntry::Ipv6Nexthop(_) => (),
+        });
     }
 }
 
@@ -314,7 +336,7 @@ impl RouteTableEntry {
                                     ),
                                 ));
                             }
-                            let mask = cursor.read_u32::<BigEndian>()?;
+                            let mask = cursor.read_u32::<BigEndian>()?.leading_ones();
                             if mask > Ipv4Addr::BITS {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
@@ -522,6 +544,15 @@ struct Rte4Prefix {
     metric: u32, // + 4 bytes = 20
 }
 
+impl Rte4Prefix {
+    fn prefix(&self) -> Ipv4Net {
+        Ipv4Net::new_assert(
+            self.addr,
+            u8::try_from(self.mask).expect("mask > u8::MAX, so u8 conversion failed"),
+        )
+    }
+}
+
 /// `RIPv2` Authentication Route Entry: contains auth instead of prefix, AFI = 0xFFFF
 ///  0                   1                   2                   3 3
 ///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -557,6 +588,12 @@ struct Rte6Prefix {
     metric: u8,
 }
 
+impl Rte6Prefix {
+    fn prefix(&self) -> Ipv6Net {
+        Ipv6Net::new_assert(self.pfx, self.pfx_len)
+    }
+}
+
 /// `RIPng` Standard Route Entry: contains next hop, metric = 0xFF
 ///  0                   1                   2                   3
 ///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -573,6 +610,29 @@ struct Rte6Nexthop {
     mbz1: u16,
     mbz2: u8,
     metric: u8, // always set to u8::MAX
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RipPathInfo {
+    nh: IpAddr,
+    ifindex: u32,
+    metric: u8,
+    tag: u16,
+}
+
+#[derive(Debug)]
+struct RipDb {
+    ripv2_rib: BTreeMap<Ipv4Net, BTreeSet<RipPathInfo>>,
+    ripng_rib: BTreeMap<Ipv6Net, BTreeSet<RipPathInfo>>,
+}
+
+impl RipDb {
+    fn new() -> Self {
+        Self {
+            ripv2_rib: BTreeMap::new(),
+            ripng_rib: BTreeMap::new(),
+        }
+    }
 }
 
 fn ifname_to_ifindex(ifname: &str) -> Result<u32, std::ffi::NulError> {
@@ -623,7 +683,7 @@ fn init_rip_sock(ver: &RipVersion, ifname: &str) -> std::io::Result<Socket> {
     }
 }
 
-fn listen_rip_sock(proto: &RipVersion, sock: &UdpSocket) {
+fn listen_rip_sock(proto: &RipVersion, sock: &UdpSocket, db: Arc<Mutex<RipDb>>) {
     let mut buf = [0u8; 4096];
     println!(
         "listening for {} on {}",
@@ -650,7 +710,6 @@ fn listen_rip_sock(proto: &RipVersion, sock: &UdpSocket) {
                 continue;
             }
 
-            // XXX: set buf len to RIP_PKT_MAX_LEN to enforce upper bounds?
             if rx_bytes > max_len {
                 println!("data too large");
                 continue;
@@ -659,6 +718,8 @@ fn listen_rip_sock(proto: &RipVersion, sock: &UdpSocket) {
             match RipPacket::from_bytes(proto, &buf[..rx_bytes]) {
                 Ok(rip_pkt) => {
                     println!("rx rip pkt ({rx_bytes} bytes) from {src_addr}:\n{rip_pkt}\n");
+                    rip_pkt.process(db.lock().unwrap().deref_mut());
+                    println!("{:?}", db);
                 }
                 Err(e) => {
                     eprintln!("failed to parse rx bytes! {e}");
@@ -749,18 +810,19 @@ fn main() -> std::io::Result<()> {
             send_rip_sock(&ripng_proto, &ripng_tx, &rp);
         }
         "listener" => {
-            // convert from socket2 -> std::net to simplify our buffer implementation.
-            // i.e. [MaybeUninit<u8>] seems more restrictive than [u8], so drop it.
+            let mut db = Arc::new(Mutex::new(RipDb::new()));
+            let db_clone = db.clone();
             let ripv2_proto = RipVersion::RIP;
             let ripv2_sock: UdpSocket = init_rip_sock(&RipVersion::RIP, &ifname)?.into();
             let ripv2_thread = std::thread::spawn(move || {
-                listen_rip_sock(&ripv2_proto, &ripv2_sock);
+                listen_rip_sock(&ripv2_proto, &ripv2_sock, db_clone);
             });
 
+            let db_clone = db.clone();
             let ripng_proto = RipVersion::RIPng;
             let ripng_sock: UdpSocket = init_rip_sock(&RipVersion::RIPng, &ifname)?.into();
             let ripng_thread = std::thread::spawn(move || {
-                listen_rip_sock(&ripng_proto, &ripng_sock);
+                listen_rip_sock(&ripng_proto, &ripng_sock, db_clone);
             });
 
             ripv2_thread.join().unwrap();
