@@ -2,12 +2,12 @@ use byteorder::{BigEndian, ReadBytesExt};
 use ipnet::{Ipv4Net, Ipv6Net};
 use socket2::{self, Domain, InterfaceIndexOrAddress, SockAddr, Socket, Type};
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::CString,
     io::Cursor,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
-    ops::DerefMut,
     str::FromStr,
     sync::{Arc, Mutex},
 };
@@ -30,10 +30,10 @@ const IPV4_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const UDP_HEADER_LEN: usize = 8;
 const RIP_HEADER_LEN: usize = 4;
-const RIP_PKT_MAX_LEN: usize =
-    (ASSUMED_MTU - IPV4_HEADER_LEN - UDP_HEADER_LEN - RIP_HEADER_LEN) / RouteTableEntry::SIZE;
-const RIPNG_PKT_MAX_LEN: usize =
-    (ASSUMED_MTU - IPV6_HEADER_LEN - UDP_HEADER_LEN - RIP_HEADER_LEN) / RouteTableEntry::SIZE;
+const RIP_PKT_MAX_LEN: usize = ASSUMED_MTU - IPV4_HEADER_LEN - UDP_HEADER_LEN - RIP_HEADER_LEN;
+// const RIP_PKT_MAX_RTE: usize = RIP_PKT_MAX_LEN / RouteTableEntry::SIZE;
+const RIPNG_PKT_MAX_LEN: usize = ASSUMED_MTU - IPV6_HEADER_LEN - UDP_HEADER_LEN - RIP_HEADER_LEN;
+// const RIPNG_PKT_MAX_RTE: usize = RIPNG_PKT_MAX_LEN / RouteTableEntry::SIZE;
 
 /// `RIP` packet structure. Applicable to both `RIPv2` and `RIPng`.
 ///  0                   1                   2                   3
@@ -148,22 +148,52 @@ impl RipPacket {
         b
     }
 
-    fn process(&self, db: &mut RipDb) {
-        self.rt_entries.iter().for_each(|rte| match rte {
-            RouteTableEntry::Ipv4Prefix(r) => {
-                let mut nh_set = BTreeSet::new();
-                nh_set.insert(RipPathInfo {
-                    nh: IpAddr::V4(r.nh),
-                    ifindex: 0u32,
-                    metric: r.metric as u8,
-                    tag: r.tag,
-                });
-                db.ripv2_rib.insert(r.prefix().clone(), nh_set.clone());
+    fn process(&mut self, db: &mut RipDb, src: IpAddr) {
+        let mut nh: Option<Ipv6Addr> = None;
+        for rte in &mut self.rt_entries {
+            match rte {
+                RouteTableEntry::Ipv4Prefix(prefix4) => {
+                    let rpi = RipPathInfo {
+                        nh: match prefix4.nh.is_unspecified() {
+                            true => src,
+                            false => IpAddr::V4(prefix4.nh),
+                        },
+                        ifindex: 0u32,
+                        metric: prefix4.metric as u8,
+                        tag: prefix4.tag,
+                    };
+                    let mut rib = db.ripv2_rib.lock().unwrap();
+                    let nh_set = rib.entry(prefix4.prefix()).or_insert(BTreeSet::new());
+                    nh_set.insert(rpi);
+                }
+                RouteTableEntry::Ipv4Authentication(auth4) => {
+                    // XXX: set auth here (need access to rif.set_auth_pw())
+                    println!("{auth4:?}");
+                    ()
+                }
+                RouteTableEntry::Ipv6Prefix(prefix6) => {
+                    let rpi = RipPathInfo {
+                        nh: match nh {
+                            None => src,
+                            Some(n) => {
+                                if n.is_unspecified() {
+                                    src
+                                } else {
+                                    IpAddr::V6(n)
+                                }
+                            }
+                        },
+                        ifindex: 0u32,
+                        metric: prefix6.metric as u8,
+                        tag: prefix6.tag,
+                    };
+                    let mut rib = db.ripng_rib.lock().unwrap();
+                    let nh_set = rib.entry(prefix6.prefix()).or_insert(BTreeSet::new());
+                    nh_set.insert(rpi);
+                }
+                RouteTableEntry::Ipv6Nexthop(nexthop6) => nh = Some(nexthop6.nh),
             }
-            RouteTableEntry::Ipv4Authentication(_) => (),
-            RouteTableEntry::Ipv6Prefix(_) => (),
-            RouteTableEntry::Ipv6Nexthop(_) => (),
-        });
+        }
     }
 }
 
@@ -315,8 +345,10 @@ enum RouteTableEntry {
 }
 
 impl RouteTableEntry {
-    // All RTEs are the same length, across all RTE types & Protocol versions
+    // All RTEs are the same length, across all RTE types & RIP Protocol versions
     const SIZE: usize = 20;
+    // RIPNg RTE with metric == 0xFF carries a nexthop
+    const RIPNG_METRIC_NEXTHOP: u8 = u8::MAX;
 
     fn from_bytes(ver: &RipVersion, b: &[u8]) -> std::io::Result<Self> {
         let mut cursor = Cursor::new(b);
@@ -328,43 +360,48 @@ impl RouteTableEntry {
                         RipV2AddressFamily::Inet => {
                             let tag = cursor.read_u16::<BigEndian>()?;
                             let addr = Ipv4Addr::from_bits(cursor.read_u32::<BigEndian>()?);
+                            let mask = cursor.read_u32::<BigEndian>()?;
+                            let nh = Ipv4Addr::from_bits(cursor.read_u32::<BigEndian>()?);
+                            let metric = cursor.read_u32::<BigEndian>()?;
+
                             if addr.is_loopback() || addr.is_multicast() {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     format!(
-                                        "Invalid prefix {addr}: cannot be multicast or loopback range"
+                                        "Invalid Prefix {addr}: cannot be multicast or loopback range"
                                     ),
                                 ));
                             }
-                            let mask = cursor.read_u32::<BigEndian>()?.leading_ones();
-                            if mask > Ipv4Addr::BITS {
+
+                            if mask.leading_ones() > Ipv4Addr::BITS {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     format!(
-                                    "Invalid mask {mask}: cannot be greater than IPv4 bit length ({})",
+                                    "Invalid Mask {mask}: cannot be greater than IPv4 bit length ({})",
                                     Ipv4Addr::BITS
                                 ),
                                 ));
                             }
-                            let nh = Ipv4Addr::from_bits(cursor.read_u32::<BigEndian>()?);
+
                             if nh.is_loopback() || nh.is_multicast() {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     format!(
-                                    "Invalid next-hop {nh}: cannot be multicast or loopback address"
-                                ),
+                                    "Invalid Nexthop {nh}: cannot be multicast or loopback address"
+                                    ),
                                 ));
                             }
-                            let metric = cursor.read_u32::<BigEndian>()?;
+
                             if metric > u32::from(RipPacket::INFINITY_METRIC) {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     format!(
-                                        "Invalid metric {metric}: cannot be greater than infinity ({})",
+                                        "Invalid Metric {metric}: cannot be greater than infinity ({})",
                                         RipPacket::INFINITY_METRIC
                                     ),
                                 ));
                             }
+
                             Ok(Self::Ipv4Prefix(Rte4Prefix {
                                 afi,
                                 tag,
@@ -376,13 +413,19 @@ impl RouteTableEntry {
                         }
                         RipV2AddressFamily::Auth => {
                             let at = cursor.read_u16::<BigEndian>()?;
+                            let pw = cursor.read_u128::<BigEndian>()?;
+
+                            // XXX: Discard entire RipPacket if auth is bad,
+                            // i.e.
+                            // 1) auth enabled but rx pkt has no/incorrect auth
+                            // 2) auth disabled but rx pkt has auth
                             let Some(auth_type) = RipV2AuthType::from_u16(at) else {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     format!("Unsupported RIPv2 Authentication Type: {at}"),
                                 ));
                             };
-                            let pw = cursor.read_u128::<BigEndian>()?;
+
                             Ok(Self::Ipv4Authentication(Rte4Auth { afi, auth_type, pw }))
                         }
                     },
@@ -394,48 +437,64 @@ impl RouteTableEntry {
                 }
             }
             RipVersion::RIPng => {
-                let addr = Ipv6Addr::from_bits(cursor.read_u128::<BigEndian>()?);
-                if addr.is_multicast() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Invalid Prefix {addr}: must be unicast"),
-                    ));
-                }
+                let pfx = Ipv6Addr::from_bits(cursor.read_u128::<BigEndian>()?);
                 let tag = cursor.read_u16::<BigEndian>()?;
-                let plen = cursor.read_u8()?;
-                if plen > u8::try_from(Ipv6Addr::BITS).unwrap() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "Invalid Prefix Length {addr}: cannot be greater than IPv6 bit length {}",
-                            Ipv6Addr::BITS
-                        ),
-                    ));
-                }
+                let pfx_len = cursor.read_u8()?;
                 let metric = cursor.read_u8()?;
-                if metric > RipPacket::INFINITY_METRIC {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "Invalid metric {metric}: cannot be greater than infinity ({})",
-                            RipPacket::INFINITY_METRIC
-                        ),
-                    ));
-                }
+
                 match metric {
-                    // Metric is always 0xFF for Nexthop
-                    u8::MAX => Ok(Self::Ipv6Nexthop(Rte6Nexthop {
-                        nh: addr,
-                        mbz1: tag,
-                        mbz2: plen,
-                        metric,
-                    })),
-                    _ => Ok(Self::Ipv6Prefix(Rte6Prefix {
-                        pfx: addr,
-                        tag,
-                        pfx_len: plen,
-                        metric,
-                    })),
+                    RouteTableEntry::RIPNG_METRIC_NEXTHOP => {
+                        if pfx.is_multicast() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Invalid Nexthop ({pfx}): must be unicast"),
+                            ));
+                        }
+
+                        Ok(Self::Ipv6Nexthop(Rte6Nexthop {
+                            nh: pfx,
+                            mbz1: tag,
+                            mbz2: pfx_len,
+                            metric,
+                        }))
+                    }
+                    // RTE with a valid metric carries a prefix
+                    0..=RipPacket::INFINITY_METRIC => {
+                        if pfx.is_multicast() || pfx.is_loopback() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "Invalid Prefix {pfx}: cannot be multicast or loopback range"
+                                ),
+                            ));
+                        }
+
+                        if pfx_len > u8::try_from(Ipv6Addr::BITS).unwrap() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "Invalid Prefix Length {pfx}: cannot be greater than IPv6 bit length {}",
+                                    Ipv6Addr::BITS
+                                ),
+                            ));
+                        }
+
+                        Ok(Self::Ipv6Prefix(Rte6Prefix {
+                            pfx,
+                            tag,
+                            pfx_len,
+                            metric,
+                        }))
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Invalid metric {metric}: cannot be greater than infinity ({})",
+                                RipPacket::INFINITY_METRIC
+                            ),
+                        ));
+                    }
                 }
             }
         }
@@ -548,8 +607,10 @@ impl Rte4Prefix {
     fn prefix(&self) -> Ipv4Net {
         Ipv4Net::new_assert(
             self.addr,
-            u8::try_from(self.mask).expect("mask > u8::MAX, so u8 conversion failed"),
+            u8::try_from(self.mask.leading_ones())
+                .expect("mask > {u8::MAX}, so u8 conversion failed"),
         )
+        .trunc()
     }
 }
 
@@ -590,7 +651,7 @@ struct Rte6Prefix {
 
 impl Rte6Prefix {
     fn prefix(&self) -> Ipv6Net {
-        Ipv6Net::new_assert(self.pfx, self.pfx_len)
+        Ipv6Net::new_assert(self.pfx, self.pfx_len).trunc()
     }
 }
 
@@ -612,7 +673,7 @@ struct Rte6Nexthop {
     metric: u8, // always set to u8::MAX
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RipPathInfo {
     nh: IpAddr,
     ifindex: u32,
@@ -620,17 +681,32 @@ struct RipPathInfo {
     tag: u16,
 }
 
-#[derive(Debug)]
+impl Ord for RipPathInfo {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.nh != other.nh {
+            return self.nh.cmp(&other.nh);
+        }
+        self.ifindex.cmp(&other.ifindex)
+    }
+}
+
+impl PartialOrd for RipPathInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Debug)]
 struct RipDb {
-    ripv2_rib: BTreeMap<Ipv4Net, BTreeSet<RipPathInfo>>,
-    ripng_rib: BTreeMap<Ipv6Net, BTreeSet<RipPathInfo>>,
+    ripv2_rib: Arc<Mutex<BTreeMap<Ipv4Net, BTreeSet<RipPathInfo>>>>,
+    ripng_rib: Arc<Mutex<BTreeMap<Ipv6Net, BTreeSet<RipPathInfo>>>>,
 }
 
 impl RipDb {
     fn new() -> Self {
         Self {
-            ripv2_rib: BTreeMap::new(),
-            ripng_rib: BTreeMap::new(),
+            ripv2_rib: Arc::new(Mutex::new(BTreeMap::new())),
+            ripng_rib: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -645,58 +721,109 @@ fn ifname_to_ifindex(ifname: &str) -> Result<u32, std::ffi::NulError> {
     Ok(ifindex)
 }
 
-fn init_rip_sock(ver: &RipVersion, ifname: &str) -> std::io::Result<Socket> {
-    let ifindex = ifname_to_ifindex(ifname)?;
-    match ver {
-        RipVersion::RIP => {
-            let ripv2_sock = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
-            ripv2_sock.set_reuse_address(true)?;
-            ripv2_sock.bind_device(Some(ifname.as_bytes()))?;
-            ripv2_sock.bind(&SockAddr::from(RIPV2_BIND))?;
-            ripv2_sock.set_multicast_all_v4(true)?;
-            // ripv2_sock.set_multicast_if_v4(&V4_IFADDR)?;
-            // XXX: we may want to disable this at some point
-            ripv2_sock.set_multicast_loop_v4(true)?;
-            ripv2_sock
-                .join_multicast_v4_n(&RIPV2_GROUP, &InterfaceIndexOrAddress::Index(ifindex))?;
-            // for whatever reason, the socket doesn't rx packets sent to 224.0.0.9
-            // if we call connect() against 224.0.0.9... so leave this unconnected for now?
-            // ripv2_sock.connect(&SockAddr::from(RIPV2_DEST))?;
-            Ok(ripv2_sock)
+struct RipInterface {
+    // XXX: Convert to &str and learn lifetimes?
+    ifname: String,
+    ifindex: u32,
+    ripv2_sock: Option<UdpSocket>,
+    ripng_sock: Option<UdpSocket>,
+    auth: Option<(RipV2AuthType, u128)>,
+}
+
+impl RipInterface {
+    fn new(ifname: String) -> Option<Self> {
+        let ifindex = ifname_to_ifindex(&ifname).ok()?;
+        Some(Self {
+            ifname,
+            ifindex,
+            ripv2_sock: None,
+            ripng_sock: None,
+            auth: None,
+        })
+    }
+
+    fn enable_ripv2(&mut self) -> std::io::Result<()> {
+        let ripv2_sock = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
+        ripv2_sock.set_reuse_address(true)?;
+        ripv2_sock.bind_device(Some(self.ifname.as_bytes()))?;
+        ripv2_sock.bind(&SockAddr::from(RIPV2_BIND))?;
+        ripv2_sock.set_multicast_all_v4(true)?;
+        // ripv2_sock.set_multicast_if_v4(&V4_IFADDR)?;
+        // XXX: we may want to disable this at some point
+        ripv2_sock.set_multicast_loop_v4(true)?;
+        ripv2_sock
+            .join_multicast_v4_n(&RIPV2_GROUP, &InterfaceIndexOrAddress::Index(self.ifindex))?;
+        // for whatever reason, the socket doesn't rx packets sent to 224.0.0.9
+        // if we call connect() against 224.0.0.9... so leave this unconnected for now?
+        // ripv2_sock.connect(&SockAddr::from(RIPV2_DEST))?;
+        self.ripv2_sock = Some(ripv2_sock.into());
+        Ok(())
+    }
+
+    fn enable_ripng(&mut self) -> std::io::Result<()> {
+        let ripng_sock = Socket::new(Domain::IPV6, Type::DGRAM, None)?;
+        ripng_sock.set_only_v6(true)?;
+        ripng_sock.set_reuse_address(true)?;
+        ripng_sock.bind_device(Some(self.ifname.as_bytes()))?;
+        ripng_sock.bind(&SockAddr::from(RIPNG_BIND))?;
+        ripng_sock.set_multicast_all_v6(true)?;
+        // ripng_sock.set_multicast_if_v6(ifindex)?;
+        // XXX: we may want to disable this at some point
+        ripng_sock.set_multicast_loop_v6(true)?;
+        ripng_sock.join_multicast_v6(&RIPNG_GROUP, self.ifindex)?;
+        // for whatever reason, the socket doesn't rx packets sent to ff02::9
+        // if we call connect() against ff02::9... so leave this unconnected for now?
+        // ripng_sock.connect(&SockAddr::from(RIPNG_DEST))?;
+        self.ripng_sock = Some(ripng_sock.into());
+        Ok(())
+    }
+
+    fn set_auth_pw(&mut self, pw: u128) -> std::io::Result<()> {
+        self.auth = Some((RipV2AuthType::Password, pw));
+        Ok(())
+    }
+
+    fn send_ripv2(&self, rp: &RipPacket) {
+        match self.ripv2_sock {
+            None => return,
+            Some(ref sock) => {
+                // use send_to() instead of send() because the socket isn't connect()'d
+                if let Ok(bytes_sent) = sock.send_to(&rp.to_byte_vec(), &RIPV2_DEST) {
+                    println!(
+                        "tx rip pkt ({bytes_sent} bytes) from {} to {}:\n{rp}\n",
+                        sock.local_addr().unwrap(),
+                        &RIPV2_DEST
+                    );
+                }
+            }
         }
-        RipVersion::RIPng => {
-            let ripng_sock = Socket::new(Domain::IPV6, Type::DGRAM, None)?;
-            ripng_sock.set_only_v6(true)?;
-            ripng_sock.set_reuse_address(true)?;
-            ripng_sock.bind_device(Some(ifname.as_bytes()))?;
-            ripng_sock.bind(&SockAddr::from(RIPNG_BIND))?;
-            ripng_sock.set_multicast_all_v6(true)?;
-            // ripng_sock.set_multicast_if_v6(ifindex)?;
-            // XXX: we may want to disable this at some point
-            ripng_sock.set_multicast_loop_v6(true)?;
-            ripng_sock.join_multicast_v6(&RIPNG_GROUP, ifindex)?;
-            // for whatever reason, the socket doesn't rx packets sent to ff02::9
-            // if we call connect() against ff02::9... so leave this unconnected for now?
-            // ripng_sock.connect(&SockAddr::from(RIPNG_DEST))?;
-            Ok(ripng_sock)
+    }
+
+    fn send_ripng(&self, rp: &RipPacket) {
+        match self.ripng_sock {
+            None => return,
+            Some(ref sock) => {
+                // use send_to() instead of send() because the socket isn't connect()'d
+                if let Ok(bytes_sent) = sock.send_to(&rp.to_byte_vec(), &RIPNG_DEST) {
+                    println!(
+                        "tx rip pkt ({bytes_sent} bytes) from {} to {}:\n{rp}\n",
+                        sock.local_addr().unwrap(),
+                        &RIPNG_DEST
+                    );
+                }
+            }
         }
     }
 }
 
-fn listen_rip_sock(proto: &RipVersion, sock: &UdpSocket, db: Arc<Mutex<RipDb>>) {
+fn listen_ripv2(sock: &UdpSocket, db: &mut RipDb) {
     let mut buf = [0u8; 4096];
     println!(
         "listening for {} on {}",
-        match proto {
-            RipVersion::RIP => "RIPv2",
-            RipVersion::RIPng => "RIPng",
-        },
+        "RIPv2",
         sock.local_addr().unwrap(),
     );
-    let max_len = match proto {
-        RipVersion::RIP => RIP_PKT_MAX_LEN,
-        RipVersion::RIPng => RIPNG_PKT_MAX_LEN,
-    };
+    let max_len = RIP_PKT_MAX_LEN;
     loop {
         buf.fill(0);
         if let Ok((rx_bytes, src_addr)) = sock.recv_from(&mut buf) {
@@ -706,20 +833,22 @@ fn listen_rip_sock(proto: &RipVersion, sock: &UdpSocket, db: Arc<Mutex<RipDb>>) 
             );
 
             if rx_bytes < RIP_HEADER_LEN {
-                println!("data too short");
+                println!("data too short, must be >= {RIP_HEADER_LEN} bytes, rx {rx_bytes} bytes");
                 continue;
             }
 
             if rx_bytes > max_len {
-                println!("data too large");
+                println!(
+                    "data too large, datagram must be >= {max_len} bytes, rx {rx_bytes} bytes"
+                );
                 continue;
             }
 
-            match RipPacket::from_bytes(proto, &buf[..rx_bytes]) {
-                Ok(rip_pkt) => {
+            match RipPacket::from_bytes(&RipVersion::RIP, &buf[..rx_bytes]) {
+                Ok(mut rip_pkt) => {
                     println!("rx rip pkt ({rx_bytes} bytes) from {src_addr}:\n{rip_pkt}\n");
-                    rip_pkt.process(db.lock().unwrap().deref_mut());
-                    println!("{:?}", db);
+                    rip_pkt.process(db, src_addr.ip());
+                    println!("RIPv2 RIB: {:#?}\n", db.ripv2_rib);
                 }
                 Err(e) => {
                     eprintln!("failed to parse rx bytes! {e}");
@@ -733,21 +862,54 @@ fn listen_rip_sock(proto: &RipVersion, sock: &UdpSocket, db: Arc<Mutex<RipDb>>) 
     }
 }
 
-fn send_rip_sock(ver: &RipVersion, sock: &UdpSocket, rp: &RipPacket) {
-    let dst = match ver {
-        RipVersion::RIP => &RIPV2_DEST,
-        RipVersion::RIPng => &RIPNG_DEST,
-    };
-    // use send_to() instead of send() because the socket isn't connect()'d
-    if let Ok(bytes_sent) = sock.send_to(&rp.to_byte_vec(), dst) {
-        println!(
-            "tx rip pkt ({bytes_sent} bytes) from {} to {dst}:\n{rp}\n",
-            sock.local_addr().unwrap()
-        );
+// XXX: figure out how to consolidate this in a sane way... possibly generics?
+fn listen_ripng(sock: &UdpSocket, db: &mut RipDb) {
+    let mut buf = [0u8; 4096];
+    println!(
+        "listening for {} on {}",
+        "RIPv2",
+        sock.local_addr().unwrap(),
+    );
+    let max_len = RIPNG_PKT_MAX_LEN;
+    loop {
+        buf.fill(0);
+        if let Ok((rx_bytes, src_addr)) = sock.recv_from(&mut buf) {
+            println!(
+                "rx {rx_bytes} bytes from {src_addr} -> {:x?}",
+                &buf[0..rx_bytes]
+            );
+
+            if rx_bytes < RIP_HEADER_LEN {
+                println!("data too short, must be >= {RIP_HEADER_LEN} bytes, rx {rx_bytes} bytes");
+                continue;
+            }
+
+            if rx_bytes > max_len {
+                println!(
+                    "data too large, datagram must be >= {max_len} bytes, rx {rx_bytes} bytes"
+                );
+                continue;
+            }
+
+            match RipPacket::from_bytes(&RipVersion::RIPng, &buf[..rx_bytes]) {
+                Ok(mut rip_pkt) => {
+                    println!("rx rip pkt ({rx_bytes} bytes) from {src_addr}:\n{rip_pkt}\n");
+                    rip_pkt.process(db, src_addr.ip());
+                    println!("RIPng RIB: {:#?}\n", db.ripng_rib);
+                }
+                Err(e) => {
+                    eprintln!("failed to parse rx bytes! {e}");
+                    continue;
+                }
+            }
+        } else {
+            eprintln!("failed to read from listening socket!");
+            break;
+        }
     }
 }
 
-const HELP: &str = "trip {sender <ifname> <msg> | listener <ifname>}";
+const HELP: &str = "trip {sender <ifname> | listener <ifname>}";
 
 fn main() -> std::io::Result<()> {
     let Some(ifname) = env::args().nth(2) else {
@@ -764,32 +926,65 @@ fn main() -> std::io::Result<()> {
 
     match mode.as_str() {
         "sender" => {
-            let ripv2_tx: UdpSocket = init_rip_sock(&RipVersion::RIP, &ifname)?.into();
-            let ripv2_proto = RipVersion::RIP;
-            let ripng_tx: UdpSocket = init_rip_sock(&RipVersion::RIPng, &ifname)?.into();
-            let ripng_proto = RipVersion::RIPng;
+            let mut rif = RipInterface::new(ifname.clone()).unwrap();
+            rif.enable_ripv2()?;
+            rif.enable_ripng()?;
 
             let rte4_list = vec![
-                RouteTableEntry::Ipv4Prefix(Rte4Prefix {
-                    afi: RipV2AddressFamily::Inet,
-                    tag: 50_u16,
-                    addr: Ipv4Addr::from_str("10.0.0.0").unwrap(),
-                    mask: Ipv4Addr::from_str("255.0.0.0").unwrap().to_bits(),
-                    nh: Ipv4Addr::from_str("192.168.0.1").unwrap(),
-                    metric: 5_u32,
-                }),
                 RouteTableEntry::Ipv4Authentication(Rte4Auth {
                     afi: RipV2AddressFamily::Auth,
                     auth_type: RipV2AuthType::Password,
                     pw: 0u128,
                 }),
+                RouteTableEntry::Ipv4Prefix(Rte4Prefix {
+                    afi: RipV2AddressFamily::Inet,
+                    tag: 50_u16,
+                    addr: Ipv4Addr::from_str("10.1.1.1").unwrap(),
+                    mask: Ipv4Addr::from_str("255.0.0.0").unwrap().to_bits(),
+                    nh: Ipv4Addr::from_str("192.168.0.1").unwrap(),
+                    metric: 5_u32,
+                }),
+                RouteTableEntry::Ipv4Prefix(Rte4Prefix {
+                    afi: RipV2AddressFamily::Inet,
+                    tag: 100_u16,
+                    addr: Ipv4Addr::from_str("20.0.0.0").unwrap(),
+                    mask: Ipv4Addr::from_str("255.0.0.0").unwrap().to_bits(),
+                    nh: Ipv4Addr::from_str("192.168.0.1").unwrap(),
+                    metric: 10_u32,
+                }),
+                RouteTableEntry::Ipv4Prefix(Rte4Prefix {
+                    afi: RipV2AddressFamily::Inet,
+                    tag: 150_u16,
+                    addr: Ipv4Addr::from_str("30.0.0.0").unwrap(),
+                    mask: Ipv4Addr::from_str("255.0.0.0").unwrap().to_bits(),
+                    nh: Ipv4Addr::from_str("192.168.0.1").unwrap(),
+                    metric: 15_u32,
+                }),
+                RouteTableEntry::Ipv4Prefix(Rte4Prefix {
+                    afi: RipV2AddressFamily::Inet,
+                    tag: 150_u16,
+                    addr: Ipv4Addr::from_str("30.0.0.0").unwrap(),
+                    mask: Ipv4Addr::from_str("255.0.0.0").unwrap().to_bits(),
+                    nh: Ipv4Addr::from_str("192.168.0.55").unwrap(),
+                    metric: 15_u32,
+                }),
+                RouteTableEntry::Ipv4Prefix(Rte4Prefix {
+                    afi: RipV2AddressFamily::Inet,
+                    tag: 150_u16,
+                    addr: Ipv4Addr::from_str("30.0.0.0").unwrap(),
+                    mask: Ipv4Addr::from_str("255.128.0.0").unwrap().to_bits(),
+                    nh: Ipv4Addr::from_str("192.168.0.55").unwrap(),
+                    metric: 15_u32,
+                }),
             ];
+
             let rte6_list = vec![
                 RouteTableEntry::Ipv6Nexthop(Rte6Nexthop {
+                    // "db8" nexthop
                     nh: Ipv6Addr::from_str("2001:db8:cafe::beef:face").unwrap(),
                     mbz1: 0_u16,
                     mbz2: 0_u8,
-                    metric: 12_u8,
+                    metric: RouteTableEntry::RIPNG_METRIC_NEXTHOP,
                 }),
                 RouteTableEntry::Ipv6Prefix(Rte6Prefix {
                     pfx: Ipv6Addr::from_str("2001:db8:cafe::dead:beef").unwrap(),
@@ -797,37 +992,87 @@ fn main() -> std::io::Result<()> {
                     pfx_len: 64_u8,
                     metric: 9_u8,
                 }),
+                RouteTableEntry::Ipv6Nexthop(Rte6Nexthop {
+                    // "db9" nexthop
+                    nh: Ipv6Addr::from_str("2001:db9:cafe::beef:face").unwrap(),
+                    mbz1: 0_u16,
+                    mbz2: 0_u8,
+                    metric: RouteTableEntry::RIPNG_METRIC_NEXTHOP,
+                }),
+                RouteTableEntry::Ipv6Prefix(Rte6Prefix {
+                    pfx: Ipv6Addr::from_str("2001:db8:cafe::dead:beef").unwrap(),
+                    tag: 60_u16,
+                    pfx_len: 64_u8,
+                    metric: 9_u8,
+                }),
+                RouteTableEntry::Ipv6Nexthop(Rte6Nexthop {
+                    // unspecified nexthop
+                    nh: Ipv6Addr::from_str("::").unwrap(),
+                    mbz1: 0_u16,
+                    mbz2: 0_u8,
+                    metric: RouteTableEntry::RIPNG_METRIC_NEXTHOP,
+                }),
+                RouteTableEntry::Ipv6Prefix(Rte6Prefix {
+                    pfx: Ipv6Addr::from_str("2001:db8:cafe::dead:beef").unwrap(),
+                    tag: 60_u16,
+                    pfx_len: 64_u8,
+                    metric: 9_u8,
+                }),
+                RouteTableEntry::Ipv6Nexthop(Rte6Nexthop {
+                    // unspecified nexthop
+                    nh: Ipv6Addr::from_str("::").unwrap(),
+                    mbz1: 0_u16,
+                    mbz2: 0_u8,
+                    metric: RouteTableEntry::RIPNG_METRIC_NEXTHOP,
+                }),
+                RouteTableEntry::Ipv6Prefix(Rte6Prefix {
+                    pfx: Ipv6Addr::from_str("3fff::dead:beef").unwrap(),
+                    tag: 60_u16,
+                    pfx_len: 32_u8,
+                    metric: 9_u8,
+                }),
             ];
 
-            let rp = RipPacket::new(RipCommand::Request, &ripv2_proto, rte4_list.clone());
-            send_rip_sock(&ripv2_proto, &ripv2_tx, &rp);
-            let rp = RipPacket::new(RipCommand::Response, &ripv2_proto, rte4_list.clone());
-            send_rip_sock(&ripv2_proto, &ripv2_tx, &rp);
+            rif.send_ripv2(&RipPacket::new(
+                RipCommand::Request,
+                &RipVersion::RIP,
+                rte4_list.clone(),
+            ));
+            rif.send_ripv2(&RipPacket::new(
+                RipCommand::Response,
+                &RipVersion::RIP,
+                rte4_list.clone(),
+            ));
 
-            let rp = RipPacket::new(RipCommand::Request, &ripng_proto, rte6_list.clone());
-            send_rip_sock(&ripng_proto, &ripng_tx, &rp);
-            let rp = RipPacket::new(RipCommand::Response, &ripng_proto, rte6_list.clone());
-            send_rip_sock(&ripng_proto, &ripng_tx, &rp);
+            rif.send_ripng(&RipPacket::new(
+                RipCommand::Request,
+                &RipVersion::RIPng,
+                rte6_list.clone(),
+            ));
+            rif.send_ripng(&RipPacket::new(
+                RipCommand::Response,
+                &RipVersion::RIPng,
+                rte6_list.clone(),
+            ));
         }
-        "listener" => {
-            let mut db = Arc::new(Mutex::new(RipDb::new()));
-            let db_clone = db.clone();
-            let ripv2_proto = RipVersion::RIP;
-            let ripv2_sock: UdpSocket = init_rip_sock(&RipVersion::RIP, &ifname)?.into();
-            let ripv2_thread = std::thread::spawn(move || {
-                listen_rip_sock(&ripv2_proto, &ripv2_sock, db_clone);
+        "listener" => std::thread::scope(|s| {
+            let mut db = RipDb::new();
+            let mut db_clone = db.clone();
+
+            let mut rif = RipInterface::new(ifname).unwrap();
+            let _ = rif.enable_ripv2();
+            let _ = rif.enable_ripng();
+            let ripv2_sock = rif.ripv2_sock.unwrap();
+            let ripng_sock = rif.ripng_sock.unwrap();
+
+            s.spawn(move || {
+                listen_ripv2(&ripv2_sock, &mut db);
             });
 
-            let db_clone = db.clone();
-            let ripng_proto = RipVersion::RIPng;
-            let ripng_sock: UdpSocket = init_rip_sock(&RipVersion::RIPng, &ifname)?.into();
-            let ripng_thread = std::thread::spawn(move || {
-                listen_rip_sock(&ripng_proto, &ripng_sock, db_clone);
+            s.spawn(move || {
+                listen_ripng(&ripng_sock, &mut db_clone);
             });
-
-            ripv2_thread.join().unwrap();
-            ripng_thread.join().unwrap();
-        }
+        }),
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
