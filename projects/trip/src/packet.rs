@@ -1,10 +1,10 @@
 use crate::types::*;
 use byteorder::{BigEndian, ReadBytesExt};
-use ipnet::{Ipv4Net, Ipv6Net};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::{
-    collections::BTreeSet,
     io::Cursor,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    sync::{Arc, Mutex},
 };
 
 /// Constants for `RIPv2` sockets
@@ -53,18 +53,22 @@ pub const RIPNG_PKT_MAX_LEN: usize =
 #[derive(Debug)]
 pub struct RipPacket {
     cmd: RipCommand, // header start
-    ver: u8,
+    ver: RipVersion,
     mbz: u16,
     rt_entries: Vec<RouteTableEntry>, // payload start
 }
 
 impl RipPacket {
-    const INFINITY_METRIC: u8 = 16;
+    pub const INFINITY_METRIC: u8 = 16;
 
-    pub fn new(cmd: RipCommand, proto: &RipVersion, rt_entries: Vec<RouteTableEntry>) -> RipPacket {
+    pub fn version(&self) -> &RipVersion {
+        &self.ver
+    }
+
+    pub fn new(cmd: RipCommand, ver: RipVersion, rt_entries: Vec<RouteTableEntry>) -> RipPacket {
         Self {
             cmd,
-            ver: proto.to_u8(),
+            ver,
             mbz: 0u16,
             rt_entries,
         }
@@ -82,16 +86,16 @@ impl RipPacket {
             ));
         };
 
-        let ver = cursor.read_u8()?;
-        if ver != proto.to_u8() {
+        let v = cursor.read_u8()?;
+        let Some(ver) = RipVersion::from_u8(proto, v) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "Invalid RIP version. Expected ({}), Received ({ver})",
+                    "Invalid RIP version. Expected ({}), Received ({v})",
                     proto.to_u8()
                 ),
             ));
-        }
+        };
 
         let mbz = cursor.read_u16::<BigEndian>()?;
         if mbz != 0 {
@@ -137,7 +141,7 @@ impl RipPacket {
     pub fn to_byte_vec(&self) -> Vec<u8> {
         let mut b = Vec::<u8>::new();
         b.push(self.cmd.to_u8()); // single byte, no order
-        b.push(self.ver); // single byte, no order
+        b.push(self.ver.to_u8()); // single byte, no order
         b.extend_from_slice(&self.mbz.to_be_bytes());
         for rte in &self.rt_entries {
             b.extend_from_slice(&rte.to_bytes());
@@ -145,7 +149,7 @@ impl RipPacket {
         b
     }
 
-    pub fn process(&mut self, db: &mut RipDb, src: IpAddr) {
+    pub fn process(&mut self, rip: Arc<Mutex<Rip>>, src: IpAddr) {
         let mut nh: Option<Ipv6Addr> = None;
         for rte in &mut self.rt_entries {
             match rte {
@@ -159,9 +163,16 @@ impl RipPacket {
                         prefix4.metric as u8,
                         prefix4.tag,
                     );
-                    let mut rib = db.ripv2();
-                    let nh_set = rib.entry(prefix4.prefix()).or_insert(BTreeSet::new());
-                    nh_set.insert(rpi);
+                    match prefix4.metric as u8 {
+                        RipPacket::INFINITY_METRIC => rip
+                            .lock()
+                            .unwrap()
+                            .remove_prefix_path(IpNet::from(prefix4.prefix()), rpi),
+                        _ => rip
+                            .lock()
+                            .unwrap()
+                            .insert_prefix_path(IpNet::from(prefix4.prefix()), rpi),
+                    }
                 }
                 RouteTableEntry::Ipv4Authentication(auth4) => {
                     // XXX: set auth here (need access to rif.set_auth_pw())
@@ -184,9 +195,16 @@ impl RipPacket {
                         prefix6.metric as u8,
                         prefix6.tag,
                     );
-                    let mut rib = db.ripng();
-                    let nh_set = rib.entry(prefix6.prefix()).or_insert(BTreeSet::new());
-                    nh_set.insert(rpi);
+                    match prefix6.metric as u8 {
+                        RipPacket::INFINITY_METRIC => rip
+                            .lock()
+                            .unwrap()
+                            .remove_prefix_path(IpNet::from(prefix6.prefix()), rpi),
+                        _ => rip
+                            .lock()
+                            .unwrap()
+                            .insert_prefix_path(IpNet::from(prefix6.prefix()), rpi),
+                    }
                 }
                 RouteTableEntry::Ipv6Nexthop(nexthop6) => nh = Some(nexthop6.nh),
             }
@@ -200,7 +218,7 @@ impl std::fmt::Display for RipPacket {
             f,
             "RipPacket {{\n\tcmd: {},\n\tver: 0x{:x},\n\tmbz: 0x{:x},\n\trt_entries: (\n{}\n\t)\n}}",
             self.cmd,
-            self.ver,
+            self.ver.to_u8(),
             self.mbz,
             self.rt_entries
                 .iter()
@@ -247,7 +265,7 @@ impl std::fmt::Display for RipCommand {
 
 /// `RIP` version numbers
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RipVersion {
     RIPv2 = 2,
     RIPng = 1,
@@ -256,6 +274,27 @@ pub enum RipVersion {
 impl RipVersion {
     fn to_u8(&self) -> u8 {
         self.clone() as u8
+    }
+
+    fn from_u8(ver: &RipVersion, v: u8) -> Option<Self> {
+        if v == ver.to_u8() {
+            Some(ver.clone())
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Display for RipVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::RIPv2 => "RIPv2",
+                Self::RIPng => "RIPng",
+            }
+        )
     }
 }
 
