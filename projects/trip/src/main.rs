@@ -1,11 +1,13 @@
-use crate::helpers::*;
-use crate::packet::*;
-use crate::types::*;
+use crate::helpers::{get_dummy_rte_lists, rip_listen};
+use crate::packet::{
+    RipCommand, RipPacket, RipV2AddressFamily, RipVersion, RouteTableEntry, Rte4Prefix,
+};
+use crate::types::{RipInterface, RipRouter};
 use std::thread::sleep;
 use std::time::Duration;
 use std::{
     env,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::Ipv4Addr,
     str::FromStr,
     sync::{Arc, Mutex},
 };
@@ -39,7 +41,7 @@ fn main() -> std::io::Result<()> {
 
     match mode.as_str() {
         "sender" => {
-            let rip = Arc::new(Mutex::new(Rip::new()));
+            let router = Arc::new(Mutex::new(RipRouter::new()));
 
             let mut rif = RipInterface::new(ifname).unwrap();
             let _ = rif.enable_rip(RipVersion::RIPv2);
@@ -47,118 +49,10 @@ fn main() -> std::io::Result<()> {
             rif.set_auth_pw(Some("foo_bar_baz"));
 
             {
-                rip.lock().unwrap().add_interface(rif.clone());
+                router.lock().unwrap().add_interface(rif.clone());
             }
 
-            let rte4_list = vec![
-                RouteTableEntry::Ipv4Authentication(Rte4Auth {
-                    afi: RipV2AddressFamily::Auth,
-                    auth_type: RipV2AuthType::Password,
-                    pw: 0u128,
-                }),
-                RouteTableEntry::Ipv4Prefix(Rte4Prefix {
-                    afi: RipV2AddressFamily::Inet,
-                    tag: 50_u16,
-                    addr: Ipv4Addr::from_str("10.1.1.1").unwrap(),
-                    mask: Ipv4Addr::from_str("255.0.0.0").unwrap().to_bits(),
-                    nh: Ipv4Addr::from_str("192.168.0.1").unwrap(),
-                    metric: 5_u32,
-                }),
-                RouteTableEntry::Ipv4Prefix(Rte4Prefix {
-                    afi: RipV2AddressFamily::Inet,
-                    tag: 100_u16,
-                    addr: Ipv4Addr::from_str("20.0.0.0").unwrap(),
-                    mask: Ipv4Addr::from_str("255.0.0.0").unwrap().to_bits(),
-                    nh: Ipv4Addr::from_str("192.168.0.1").unwrap(),
-                    metric: 10_u32,
-                }),
-                RouteTableEntry::Ipv4Prefix(Rte4Prefix {
-                    afi: RipV2AddressFamily::Inet,
-                    tag: 150_u16,
-                    addr: Ipv4Addr::from_str("30.0.0.0").unwrap(),
-                    mask: Ipv4Addr::from_str("255.0.0.0").unwrap().to_bits(),
-                    nh: Ipv4Addr::from_str("192.168.0.1").unwrap(),
-                    metric: 15_u32,
-                }),
-                RouteTableEntry::Ipv4Prefix(Rte4Prefix {
-                    afi: RipV2AddressFamily::Inet,
-                    tag: 150_u16,
-                    addr: Ipv4Addr::from_str("30.0.0.0").unwrap(),
-                    mask: Ipv4Addr::from_str("255.0.0.0").unwrap().to_bits(),
-                    nh: Ipv4Addr::from_str("192.168.0.55").unwrap(),
-                    metric: 15_u32,
-                }),
-                RouteTableEntry::Ipv4Prefix(Rte4Prefix {
-                    afi: RipV2AddressFamily::Inet,
-                    tag: 150_u16,
-                    addr: Ipv4Addr::from_str("30.0.0.0").unwrap(),
-                    mask: Ipv4Addr::from_str("255.128.0.0").unwrap().to_bits(),
-                    nh: Ipv4Addr::from_str("192.168.0.55").unwrap(),
-                    metric: 15_u32,
-                }),
-            ];
-
-            let rte6_list = vec![
-                // prefix sent before nexthop, so rx'er should treat this as implicit nh (use src ip)
-                RouteTableEntry::Ipv6Prefix(Rte6Prefix {
-                    pfx: Ipv6Addr::from_str("4001:db8:cafe::dead:beef").unwrap(),
-                    tag: 60_u16,
-                    pfx_len: 64_u8,
-                    metric: 9_u8,
-                }),
-                RouteTableEntry::Ipv6Nexthop(Rte6Nexthop {
-                    // "db8" nexthop
-                    nh: Ipv6Addr::from_str("2001:db8:cafe::beef:face").unwrap(),
-                    mbz1: 0_u16,
-                    mbz2: 0_u8,
-                    metric: RouteTableEntry::RIPNG_METRIC_NEXTHOP,
-                }),
-                RouteTableEntry::Ipv6Prefix(Rte6Prefix {
-                    pfx: Ipv6Addr::from_str("2001:db8:cafe::dead:beef").unwrap(),
-                    tag: 60_u16,
-                    pfx_len: 64_u8,
-                    metric: 9_u8,
-                }),
-                RouteTableEntry::Ipv6Nexthop(Rte6Nexthop {
-                    // "db9" nexthop
-                    nh: Ipv6Addr::from_str("2001:db9:cafe::beef:face").unwrap(),
-                    mbz1: 0_u16,
-                    mbz2: 0_u8,
-                    metric: RouteTableEntry::RIPNG_METRIC_NEXTHOP,
-                }),
-                RouteTableEntry::Ipv6Prefix(Rte6Prefix {
-                    pfx: Ipv6Addr::from_str("2001:db8:cafe::dead:beef").unwrap(),
-                    tag: 60_u16,
-                    pfx_len: 64_u8,
-                    metric: 9_u8,
-                }),
-                RouteTableEntry::Ipv6Nexthop(Rte6Nexthop {
-                    // unspecified nexthop
-                    nh: Ipv6Addr::from_str("::").unwrap(),
-                    mbz1: 0_u16,
-                    mbz2: 0_u8,
-                    metric: RouteTableEntry::RIPNG_METRIC_NEXTHOP,
-                }),
-                RouteTableEntry::Ipv6Prefix(Rte6Prefix {
-                    pfx: Ipv6Addr::from_str("2001:db8:cafe::dead:beef").unwrap(),
-                    tag: 60_u16,
-                    pfx_len: 64_u8,
-                    metric: 9_u8,
-                }),
-                RouteTableEntry::Ipv6Nexthop(Rte6Nexthop {
-                    // unspecified nexthop
-                    nh: Ipv6Addr::from_str("::").unwrap(),
-                    mbz1: 0_u16,
-                    mbz2: 0_u8,
-                    metric: RouteTableEntry::RIPNG_METRIC_NEXTHOP,
-                }),
-                RouteTableEntry::Ipv6Prefix(Rte6Prefix {
-                    pfx: Ipv6Addr::from_str("3fff::dead:beef").unwrap(),
-                    tag: 60_u16,
-                    pfx_len: 32_u8,
-                    metric: 9_u8,
-                }),
-            ];
+            let (rte4_list, rte6_list) = get_dummy_rte_lists();
 
             rif.send(&RipPacket::new(
                 RipCommand::Request,
@@ -197,33 +91,33 @@ fn main() -> std::io::Result<()> {
             ));
         }
         "listener" => std::thread::scope(|s| {
-            let mut rip = Rip::new();
+            let mut router = RipRouter::new();
 
             let mut rif = RipInterface::new(ifname).unwrap();
             let _ = rif.enable_rip(RipVersion::RIPv2);
             let _ = rif.enable_rip(RipVersion::RIPng);
             rif.set_auth_pw(Some("foo_bar_baz"));
-            rip.add_interface(rif.clone());
+            router.add_interface(rif.clone());
 
             let ripv2_sock = rif.socket(RipVersion::RIPv2).unwrap();
             let ripng_sock = rif.socket(RipVersion::RIPng).unwrap();
 
-            let rip = Arc::new(Mutex::new(rip));
-            let ripv2 = rip.clone();
-            let ripng = rip.clone();
+            let router = Arc::new(Mutex::new(router));
+            let ripv2 = router.clone();
+            let ripng = router.clone();
 
             s.spawn(move || {
-                rip_listen(&RipVersion::RIPv2, &ripv2_sock, ripv2);
+                rip_listen(RipVersion::RIPv2, &ripv2_sock, &ripv2);
             });
 
             s.spawn(move || {
-                rip_listen(&RipVersion::RIPng, &ripng_sock, ripng);
+                rip_listen(RipVersion::RIPng, &ripng_sock, &ripng);
             });
 
             loop {
-                println!("[MAIN THREAD]: {:#?}\n", rip.lock().unwrap().db4());
-                println!("[MAIN THREAD]: {:#?}\n", rip.lock().unwrap().db6());
-                let _ = sleep(Duration::from_secs(10));
+                println!("[MAIN THREAD]: {:#?}\n", router.lock().unwrap().db4());
+                println!("[MAIN THREAD]: {:#?}\n", router.lock().unwrap().db6());
+                sleep(Duration::from_secs(10));
             }
         }),
         _ => {

@@ -1,7 +1,8 @@
-use crate::types::*;
+use crate::types::{RipPathInfo, RipRouter};
 use byteorder::{BigEndian, ReadBytesExt};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::{
+    fmt::Debug,
     io::Cursor,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{Arc, Mutex},
@@ -61,8 +62,8 @@ pub struct RipPacket {
 impl RipPacket {
     pub const INFINITY_METRIC: u8 = 16;
 
-    pub fn version(&self) -> &RipVersion {
-        &self.ver
+    pub fn version(&self) -> RipVersion {
+        self.ver
     }
 
     pub fn new(cmd: RipCommand, ver: RipVersion, rt_entries: Vec<RouteTableEntry>) -> RipPacket {
@@ -74,7 +75,7 @@ impl RipPacket {
         }
     }
 
-    pub fn from_bytes(proto: &RipVersion, b: &[u8]) -> std::io::Result<Self> {
+    pub fn from_bytes(proto: RipVersion, b: &[u8]) -> std::io::Result<Self> {
         let mut cursor = Cursor::new(b);
 
         // START HEADER
@@ -105,7 +106,7 @@ impl RipPacket {
         } // END HEADER
 
         let total_len = b.len();
-        let header_len = cursor.position() as usize;
+        let header_len = usize::try_from(cursor.position()).unwrap();
         let payload_len = total_len - header_len;
         if payload_len % RouteTableEntry::SIZE != 0 {
             return Err(std::io::Error::new(
@@ -120,7 +121,7 @@ impl RipPacket {
         let num_rtes = payload_len / RouteTableEntry::SIZE;
         let mut rt_entries: Vec<RouteTableEntry> = Vec::with_capacity(num_rtes);
         for _ in 0..num_rtes {
-            let start = cursor.position() as usize;
+            let start = usize::try_from(cursor.position()).unwrap();
             let end = start + RouteTableEntry::SIZE;
             let rte_bytes = &b[start..end];
             match RouteTableEntry::from_bytes(proto, rte_bytes) {
@@ -149,35 +150,36 @@ impl RipPacket {
         b
     }
 
-    pub fn process(&mut self, rip: Arc<Mutex<Rip>>, src: IpAddr) {
+    pub fn process(&mut self, router: &Arc<Mutex<RipRouter>>, src: IpAddr) {
         let mut nh: Option<Ipv6Addr> = None;
         for rte in &mut self.rt_entries {
             match rte {
                 RouteTableEntry::Ipv4Prefix(prefix4) => {
+                    let metric = u8::try_from(prefix4.metric).unwrap();
                     let rpi = RipPathInfo::new(
-                        match prefix4.nh.is_unspecified() {
-                            true => src,
-                            false => IpAddr::V4(prefix4.nh),
+                        if prefix4.nh.is_unspecified() {
+                            src
+                        } else {
+                            IpAddr::V4(prefix4.nh)
                         },
                         0u32,
-                        prefix4.metric as u8,
+                        metric,
                         prefix4.tag,
                     );
-                    match prefix4.metric as u8 {
-                        RipPacket::INFINITY_METRIC => rip
+                    match metric {
+                        RipPacket::INFINITY_METRIC => router
                             .lock()
                             .unwrap()
-                            .remove_prefix_path(IpNet::from(prefix4.prefix()), rpi),
-                        _ => rip
+                            .remove_prefix_path(IpNet::from(prefix4.prefix()), &rpi),
+                        _ => router
                             .lock()
                             .unwrap()
-                            .insert_prefix_path(IpNet::from(prefix4.prefix()), rpi),
+                            .insert_prefix_path(IpNet::from(prefix4.prefix()), &rpi),
                     }
                 }
                 RouteTableEntry::Ipv4Authentication(auth4) => {
                     // XXX: set auth here (need access to rif.set_auth_pw())
                     println!("{auth4:?}");
-                    ()
                 }
                 RouteTableEntry::Ipv6Prefix(prefix6) => {
                     let rpi = RipPathInfo::new(
@@ -192,18 +194,18 @@ impl RipPacket {
                             }
                         },
                         0u32,
-                        prefix6.metric as u8,
+                        prefix6.metric,
                         prefix6.tag,
                     );
-                    match prefix6.metric as u8 {
-                        RipPacket::INFINITY_METRIC => rip
+                    match prefix6.metric {
+                        RipPacket::INFINITY_METRIC => router
                             .lock()
                             .unwrap()
-                            .remove_prefix_path(IpNet::from(prefix6.prefix()), rpi),
-                        _ => rip
+                            .remove_prefix_path(IpNet::from(prefix6.prefix()), &rpi),
+                        _ => router
                             .lock()
                             .unwrap()
-                            .insert_prefix_path(IpNet::from(prefix6.prefix()), rpi),
+                            .insert_prefix_path(IpNet::from(prefix6.prefix()), &rpi),
                     }
                 }
                 RouteTableEntry::Ipv6Nexthop(nexthop6) => nh = Some(nexthop6.nh),
@@ -230,15 +232,15 @@ impl std::fmt::Display for RipPacket {
 }
 
 /// RIP message type
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RipCommand {
     Request = 1,
     Response = 2,
 }
 
 impl RipCommand {
-    fn to_u8(&self) -> u8 {
-        self.clone() as u8
+    fn to_u8(self) -> u8 {
+        self as u8
     }
 
     fn from_u8(n: u8) -> Option<Self> {
@@ -265,24 +267,10 @@ impl std::fmt::Display for RipCommand {
 
 /// `RIP` version numbers
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RipVersion {
     RIPv2 = 2,
     RIPng = 1,
-}
-
-impl RipVersion {
-    fn to_u8(&self) -> u8 {
-        self.clone() as u8
-    }
-
-    fn from_u8(ver: &RipVersion, v: u8) -> Option<Self> {
-        if v == ver.to_u8() {
-            Some(ver.clone())
-        } else {
-            None
-        }
-    }
 }
 
 impl std::fmt::Display for RipVersion {
@@ -298,8 +286,22 @@ impl std::fmt::Display for RipVersion {
     }
 }
 
+impl RipVersion {
+    fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    fn from_u8(ver: RipVersion, v: u8) -> Option<Self> {
+        if v == ver.to_u8() {
+            Some(ver)
+        } else {
+            None
+        }
+    }
+}
+
 /// `RIPv2` Address-Family Identifiers
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RipV2AddressFamily {
     Inet = 0x0002,
     Auth = 0xFFFF,
@@ -330,7 +332,7 @@ impl RipV2AddressFamily {
         }
     }
 
-    fn to_u16(&self) -> u16 {
+    fn to_u16(self) -> u16 {
         match self {
             Self::Inet => 0x0002,
             Self::Auth => 0xFFFF,
@@ -339,7 +341,7 @@ impl RipV2AddressFamily {
 }
 
 /// `RIPv2` Authentication Types
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RipV2AuthType {
     Password = 0x0002,
 }
@@ -366,14 +368,15 @@ impl RipV2AuthType {
         }
     }
 
-    fn to_u16(&self) -> u16 {
-        self.clone() as u16
+    fn to_u16(self) -> u16 {
+        self as u16
     }
 }
 
 /// Route Table Entry Types
 #[derive(Clone, Debug)]
 pub enum RouteTableEntry {
+    // XXX: remove a layer of enum nesting here?
     Ipv4Prefix(Rte4Prefix),
     Ipv4Authentication(Rte4Auth),
     Ipv6Prefix(Rte6Prefix),
@@ -386,86 +389,20 @@ impl RouteTableEntry {
     // RIPNg RTE with metric == 0xFF carries a nexthop
     pub const RIPNG_METRIC_NEXTHOP: u8 = u8::MAX;
 
-    fn from_bytes(ver: &RipVersion, b: &[u8]) -> std::io::Result<Self> {
-        let mut cursor = Cursor::new(b);
+    fn from_bytes(ver: RipVersion, b: &[u8]) -> std::io::Result<Self> {
         match ver {
             RipVersion::RIPv2 => {
+                let mut cursor = Cursor::new(b);
                 let af = cursor.read_u16::<BigEndian>()?;
                 match RipV2AddressFamily::from_u16(af) {
                     Some(afi) => match afi {
                         RipV2AddressFamily::Inet => {
-                            let tag = cursor.read_u16::<BigEndian>()?;
-                            let addr = Ipv4Addr::from_bits(cursor.read_u32::<BigEndian>()?);
-                            let mask = cursor.read_u32::<BigEndian>()?;
-                            let nh = Ipv4Addr::from_bits(cursor.read_u32::<BigEndian>()?);
-                            let metric = cursor.read_u32::<BigEndian>()?;
-
-                            if addr.is_loopback() || addr.is_multicast() {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!(
-                                        "Invalid Prefix {addr}: cannot be multicast or loopback range"
-                                    ),
-                                ));
-                            }
-
-                            if mask.leading_ones() > Ipv4Addr::BITS {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!(
-                                    "Invalid Mask {mask}: cannot be greater than IPv4 bit length ({})",
-                                    Ipv4Addr::BITS
-                                ),
-                                ));
-                            }
-
-                            if nh.is_loopback() || nh.is_multicast() {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!(
-                                    "Invalid Nexthop {nh}: cannot be multicast or loopback address"
-                                    ),
-                                ));
-                            }
-
-                            if metric > u32::from(RipPacket::INFINITY_METRIC) {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!(
-                                        "Invalid Metric {metric}: cannot be greater than infinity ({})",
-                                        RipPacket::INFINITY_METRIC
-                                    ),
-                                ));
-                            }
-
-                            Ok(Self::Ipv4Prefix(Rte4Prefix {
-                                afi,
-                                tag,
-                                addr,
-                                mask,
-                                nh,
-                                metric,
-                            }))
+                            Ok(RouteTableEntry::Ipv4Prefix(Rte4Prefix::parse(&mut cursor)?))
                         }
-                        RipV2AddressFamily::Auth => {
-                            let at = cursor.read_u16::<BigEndian>()?;
-                            let pw = cursor.read_u128::<BigEndian>()?;
-
-                            // XXX: Discard entire RipPacket if auth is bad,
-                            // i.e.
-                            // 1) auth enabled but rx pkt has no/incorrect auth
-                            // 2) auth disabled but rx pkt has auth
-                            let Some(auth_type) = RipV2AuthType::from_u16(at) else {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("Unsupported RIPv2 Authentication Type: {at}"),
-                                ));
-                            };
-
-                            Ok(Self::Ipv4Authentication(Rte4Auth { afi, auth_type, pw }))
-                        }
+                        RipV2AddressFamily::Auth => Ok(RouteTableEntry::Ipv4Authentication(
+                            Rte4Auth::parse(&mut cursor)?,
+                        )),
                     },
-
                     None => Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("Unsupported RIPv2 Address Family: {af}"),
@@ -473,64 +410,27 @@ impl RouteTableEntry {
                 }
             }
             RipVersion::RIPng => {
+                let mut cursor = Cursor::new(b);
                 let pfx = Ipv6Addr::from_bits(cursor.read_u128::<BigEndian>()?);
                 let tag = cursor.read_u16::<BigEndian>()?;
                 let pfx_len = cursor.read_u8()?;
                 let metric = cursor.read_u8()?;
 
                 match metric {
-                    RouteTableEntry::RIPNG_METRIC_NEXTHOP => {
-                        if pfx.is_multicast() {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("Invalid Nexthop ({pfx}): must be unicast"),
-                            ));
-                        }
-
-                        Ok(Self::Ipv6Nexthop(Rte6Nexthop {
-                            nh: pfx,
-                            mbz1: tag,
-                            mbz2: pfx_len,
-                            metric,
-                        }))
-                    }
+                    RouteTableEntry::RIPNG_METRIC_NEXTHOP => Ok(RouteTableEntry::Ipv6Nexthop(
+                        Rte6Nexthop::from_parts(pfx, tag, pfx_len, metric)?,
+                    )),
                     // RTE with a valid metric carries a prefix
-                    0..=RipPacket::INFINITY_METRIC => {
-                        if pfx.is_multicast() || pfx.is_loopback() {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!(
-                                    "Invalid Prefix {pfx}: cannot be multicast or loopback range"
-                                ),
-                            ));
-                        }
-
-                        if pfx_len > u8::try_from(Ipv6Addr::BITS).unwrap() {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!(
-                                    "Invalid Prefix Length {pfx}: cannot be greater than IPv6 bit length {}",
-                                    Ipv6Addr::BITS
-                                ),
-                            ));
-                        }
-
-                        Ok(Self::Ipv6Prefix(Rte6Prefix {
-                            pfx,
-                            tag,
-                            pfx_len,
-                            metric,
-                        }))
-                    }
-                    _ => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "Invalid metric {metric}: cannot be greater than infinity ({})",
-                                RipPacket::INFINITY_METRIC
-                            ),
-                        ));
-                    }
+                    0..=RipPacket::INFINITY_METRIC => Ok(RouteTableEntry::Ipv6Prefix(
+                        Rte6Prefix::from_parts(pfx, tag, pfx_len, metric)?,
+                    )),
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Invalid metric {metric}: cannot be greater than infinity ({})",
+                            RipPacket::INFINITY_METRIC
+                        ),
+                    )),
                 }
             }
         }
@@ -648,6 +548,57 @@ impl Rte4Prefix {
         )
         .trunc()
     }
+
+    fn parse(cursor: &mut Cursor<&[u8]>) -> std::io::Result<Self> {
+        let tag = cursor.read_u16::<BigEndian>()?;
+        let addr = Ipv4Addr::from_bits(cursor.read_u32::<BigEndian>()?);
+        let mask = cursor.read_u32::<BigEndian>()?;
+        let nh = Ipv4Addr::from_bits(cursor.read_u32::<BigEndian>()?);
+        let metric = cursor.read_u32::<BigEndian>()?;
+
+        if addr.is_loopback() || addr.is_multicast() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid Prefix {addr}: cannot be multicast or loopback range"),
+            ));
+        }
+
+        if mask.leading_ones() > Ipv4Addr::BITS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid Mask {mask}: cannot be greater than IPv4 bit length ({})",
+                    Ipv4Addr::BITS
+                ),
+            ));
+        }
+
+        if nh.is_loopback() || nh.is_multicast() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid Nexthop {nh}: cannot be multicast or loopback address"),
+            ));
+        }
+
+        if metric > u32::from(RipPacket::INFINITY_METRIC) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid Metric {metric}: cannot be greater than infinity ({})",
+                    RipPacket::INFINITY_METRIC
+                ),
+            ));
+        }
+
+        Ok(Rte4Prefix {
+            afi: RipV2AddressFamily::Inet,
+            tag,
+            addr,
+            mask,
+            nh,
+            metric,
+        })
+    }
 }
 
 /// `RIPv2` Authentication Route Entry: contains auth instead of prefix, AFI = 0xFFFF
@@ -665,6 +616,30 @@ pub struct Rte4Auth {
     pub afi: RipV2AddressFamily,
     pub auth_type: RipV2AuthType,
     pub pw: u128,
+}
+
+impl Rte4Auth {
+    fn parse(cursor: &mut Cursor<&[u8]>) -> std::io::Result<Self> {
+        let at = cursor.read_u16::<BigEndian>()?;
+        let pw = cursor.read_u128::<BigEndian>()?;
+
+        // XXX: Discard entire RipPacket if auth is bad,
+        // i.e.
+        // 1) auth enabled but rx pkt has no/incorrect auth
+        // 2) auth disabled but rx pkt has auth
+        let Some(auth_type) = RipV2AuthType::from_u16(at) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unsupported RIPv2 Authentication Type: {at}"),
+            ));
+        };
+
+        Ok(Rte4Auth {
+            afi: RipV2AddressFamily::Auth,
+            auth_type,
+            pw,
+        })
+    }
 }
 
 /// `RIPng` Standard Route Entry: contains prefix.
@@ -689,6 +664,32 @@ impl Rte6Prefix {
     fn prefix(&self) -> Ipv6Net {
         Ipv6Net::new_assert(self.pfx, self.pfx_len).trunc()
     }
+
+    fn from_parts(pfx: Ipv6Addr, tag: u16, pfx_len: u8, metric: u8) -> std::io::Result<Self> {
+        if pfx.is_multicast() || pfx.is_loopback() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid Prefix {pfx}: cannot be multicast or loopback range"),
+            ));
+        }
+
+        if pfx_len > u8::try_from(Ipv6Addr::BITS).unwrap() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid Prefix Length {pfx}: cannot be greater than IPv6 bit length {}",
+                    Ipv6Addr::BITS
+                ),
+            ));
+        }
+
+        Ok(Self {
+            pfx,
+            tag,
+            pfx_len,
+            metric,
+        })
+    }
 }
 
 /// `RIPng` Standard Route Entry: contains next hop, metric = 0xFF
@@ -707,4 +708,30 @@ pub struct Rte6Nexthop {
     pub mbz1: u16,
     pub mbz2: u8,
     pub metric: u8, // always set to u8::MAX
+}
+
+impl Rte6Nexthop {
+    fn from_parts(nh: Ipv6Addr, mbz1: u16, mbz2: u8, metric: u8) -> std::io::Result<Self> {
+        if nh.is_multicast() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid Nexthop ({nh}): must be unicast"),
+            ));
+        }
+
+        if mbz1 != 0 {
+            eprintln!("2-byte must-be-zero field is not set to zero: {mbz1}");
+        }
+
+        if mbz2 != 0 {
+            eprintln!("1-byte must-be-zero field is not set to zero: {mbz2}");
+        }
+
+        Ok(Self {
+            nh,
+            mbz1,
+            mbz2,
+            metric,
+        })
+    }
 }

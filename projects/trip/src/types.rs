@@ -1,23 +1,27 @@
-use crate::helpers::*;
-use crate::packet::*;
+use crate::helpers::ifname_to_ifindex;
+use crate::packet::{
+    RipPacket, RipV2AuthType, RipVersion, ASSUMED_MTU, RIPNG_BIND, RIPNG_DEST, RIPNG_GROUP,
+    RIPV2_BIND, RIPV2_DEST, RIPV2_GROUP,
+};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use socket2::{self, Domain, InterfaceIndexOrAddress, SockAddr, Socket, Type};
 use std::{
-    cmp::Ordering,
+    cmp::{Ord, Ordering},
     collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
     net::{IpAddr, UdpSocket},
     sync::{Arc, Mutex},
 };
 
 #[derive(Debug)]
-pub struct Rip {
+pub struct RipRouter {
     pub db4: Arc<Mutex<RipDb<Ipv4Net>>>,
     pub db6: Arc<Mutex<RipDb<Ipv6Net>>>,
     pub interfaces: BTreeMap<String, RipInterface>,
     pub log: String, // XXX
 }
 
-impl Rip {
+impl RipRouter {
     pub fn new() -> Self {
         Self {
             db4: Arc::new(Mutex::new(RipDb::new())),
@@ -35,17 +39,17 @@ impl Rip {
         self.db6.lock().unwrap().clone()
     }
 
-    pub fn insert_prefix_path(&mut self, pfx: IpNet, path: RipPathInfo) {
+    pub fn insert_prefix_path(&mut self, pfx: IpNet, path: &RipPathInfo) {
         match pfx {
             IpNet::V4(p4) => self.db4.lock().unwrap().insert(p4, path),
             IpNet::V6(p6) => self.db6.lock().unwrap().insert(p6, path),
         }
     }
 
-    pub fn remove_prefix_path(&mut self, pfx: IpNet, path: RipPathInfo) {
+    pub fn remove_prefix_path(&mut self, pfx: IpNet, path: &RipPathInfo) {
         match pfx {
-            IpNet::V4(p4) => self.db4.lock().unwrap().remove(p4, path),
-            IpNet::V6(p6) => self.db6.lock().unwrap().remove(p6, path),
+            IpNet::V4(p4) => self.db4.lock().unwrap().remove(&p4, path),
+            IpNet::V6(p6) => self.db6.lock().unwrap().remove(&p6, path),
         }
     }
 
@@ -57,28 +61,31 @@ impl Rip {
 #[derive(Clone, Debug)]
 pub struct RipDb<P>(BTreeMap<P, BTreeSet<RipPathInfo>>);
 
-impl<P: Clone + std::cmp::Ord + std::fmt::Debug> RipDb<P> {
+impl<P> RipDb<P>
+where
+    P: Clone + Ord + Debug,
+{
     pub fn new() -> Self {
         Self(BTreeMap::new())
     }
 
-    pub fn insert(&mut self, pfx: P, path: RipPathInfo) {
-        let nh_set = self.0.entry(pfx).or_insert(BTreeSet::new());
-        nh_set.insert(path);
+    pub fn insert(&mut self, pfx: P, path: &RipPathInfo) {
+        let nh_set = self.0.entry(pfx).or_default();
+        nh_set.insert(path.clone());
     }
 
-    pub fn remove(&mut self, pfx: P, path: RipPathInfo) {
-        match self.0.get_mut(&pfx) {
+    pub fn remove(&mut self, pfx: &P, path: &RipPathInfo) {
+        match self.0.get_mut(pfx) {
             // no paths: remove the key
             None => {
-                self.0.remove(&pfx);
+                self.0.remove(pfx);
             }
             // some paths: remove this path
             Some(nh_set) => {
-                let _ = nh_set.remove(&path);
+                let _ = nh_set.remove(path);
                 // we just removed the last path: remove the key
                 if nh_set.is_empty() {
-                    self.0.remove(&pfx);
+                    self.0.remove(pfx);
                 }
             }
         };
@@ -115,10 +122,7 @@ impl RipInterface {
             RipVersion::RIPv2 => &self.sock4,
             RipVersion::RIPng => &self.sock6,
         };
-        match sock {
-            None => None,
-            Some(s) => Some(s.clone()),
-        }
+        sock.as_ref().map(std::clone::Clone::clone)
     }
 
     pub fn enable_rip(&mut self, ver: RipVersion) -> std::io::Result<()> {
@@ -194,7 +198,7 @@ impl RipInterface {
             RipVersion::RIPng => (&self.sock6, &RIPNG_DEST),
         };
         match socket {
-            None => return,
+            None => (),
             Some(ref sock) => {
                 // use send_to() instead of send() because the socket isn't connect()'d
                 if let Ok(bytes_sent) = sock.send_to(&rp.to_byte_vec(), dst) {
