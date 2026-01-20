@@ -108,7 +108,7 @@ impl RipPacket {
         let total_len = b.len();
         let header_len = usize::try_from(cursor.position()).unwrap();
         let payload_len = total_len - header_len;
-        if payload_len % RouteTableEntry::SIZE != 0 {
+        if !payload_len.is_multiple_of(RouteTableEntry::SIZE) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(

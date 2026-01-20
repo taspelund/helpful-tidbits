@@ -3,6 +3,7 @@ use crate::packet::{
     Rte4Prefix, Rte6Nexthop, Rte6Prefix, RIPNG_PKT_MAX_LEN, RIP_HEADER_LEN, RIP_PKT_MAX_LEN,
 };
 use crate::types::RipRouter;
+use slog::{info, Drain, Logger};
 use std::{
     ffi::CString,
     net::{Ipv4Addr, Ipv6Addr, UdpSocket},
@@ -124,6 +125,17 @@ pub fn get_dummy_rte_lists() -> (Vec<RouteTableEntry>, Vec<RouteTableEntry>) {
     (rte4_list, rte6_list)
 }
 
+pub fn init_logger() -> Logger {
+    let decorator = slog_term::TermDecorator::new().build();
+    let drain = slog_term::FullFormat::new(decorator).build().fuse();
+    let drain = slog_envlogger::new(drain).fuse();
+    let drain = slog_async::Async::new(drain)
+        .chan_size(0x2000)
+        .build()
+        .fuse();
+    slog::Logger::root(drain, slog::o!())
+}
+
 pub fn ifname_to_ifindex(ifname: &str) -> Result<u32, std::ffi::NulError> {
     let ifindex = unsafe {
         let ifstr = CString::new(ifname)?.into_raw();
@@ -136,7 +148,11 @@ pub fn ifname_to_ifindex(ifname: &str) -> Result<u32, std::ffi::NulError> {
 
 pub fn rip_listen(ver: RipVersion, sock: &UdpSocket, router: &Arc<Mutex<RipRouter>>) {
     let mut buf = [0u8; 4096];
-    println!("listening for {ver} on {}", sock.local_addr().unwrap(),);
+    info!(
+        router.lock().unwrap().log,
+        "listening for {ver} on {}",
+        sock.local_addr().unwrap(),
+    );
     let max_len = match ver {
         RipVersion::RIPv2 => RIP_PKT_MAX_LEN,
         RipVersion::RIPng => RIPNG_PKT_MAX_LEN,

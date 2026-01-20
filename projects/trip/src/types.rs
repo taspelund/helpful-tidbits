@@ -1,9 +1,10 @@
-use crate::helpers::ifname_to_ifindex;
+use crate::helpers::{ifname_to_ifindex, init_logger};
 use crate::packet::{
     RipPacket, RipV2AuthType, RipVersion, ASSUMED_MTU, RIPNG_BIND, RIPNG_DEST, RIPNG_GROUP,
     RIPV2_BIND, RIPV2_DEST, RIPV2_GROUP,
 };
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use slog::Logger;
 use socket2::{self, Domain, InterfaceIndexOrAddress, SockAddr, Socket, Type};
 use std::{
     cmp::{Ord, Ordering},
@@ -18,7 +19,7 @@ pub struct RipRouter {
     pub db4: Arc<Mutex<RipDb<Ipv4Net>>>,
     pub db6: Arc<Mutex<RipDb<Ipv6Net>>>,
     pub interfaces: BTreeMap<String, RipInterface>,
-    pub log: String, // XXX
+    pub log: Logger,
 }
 
 impl RipRouter {
@@ -27,7 +28,7 @@ impl RipRouter {
             db4: Arc::new(Mutex::new(RipDb::new())),
             db6: Arc::new(Mutex::new(RipDb::new())),
             interfaces: BTreeMap::new(),
-            log: String::new(),
+            log: init_logger(),
         }
     }
 
